@@ -62,4 +62,19 @@ fn main() {
     println!("cargo:rustc-env=VICTORY_SHADER_SOURCE_HASH={:016x}{:016x}", state[0], state[1]);
     let joined: Vec<_> = switches.into_iter().collect();
     println!("cargo:rustc-env=VICTORY_SHADER_SWITCHES={}", joined.join(","));
+    // The D3D12 Agility SDK for this crate's test executables: export the
+    // runtime only when `cargo xtask agility` put it in this profile's D3D12
+    // folder; otherwise the in-box runtime is used, as before.
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
+    if let Some(profile) = out.ancestors().nth(3) {
+        let core = profile.join("D3D12").join("D3D12Core.dll");
+        let msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
+        if msvc && core.exists() {
+            println!("cargo::rerun-if-changed={}", core.display());
+            println!("cargo::rustc-link-arg=/EXPORT:D3D12SDKVersion,DATA");
+            println!("cargo::rustc-link-arg=/EXPORT:D3D12SDKPath,DATA");
+        } else {
+            println!("cargo::rerun-if-changed=build.rs");
+        }
+    }
 }
