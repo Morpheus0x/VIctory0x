@@ -7,6 +7,8 @@
 //! console-only intrinsics, so the GFX10 code is translated in general.
 
 pub mod bvh;
+#[cfg(all(test, windows))]
+mod agility;
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;
