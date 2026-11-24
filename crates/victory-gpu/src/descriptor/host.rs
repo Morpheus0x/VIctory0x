@@ -3284,6 +3284,41 @@ void main() {
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
+    /// A null texture UAV keeps the title's dimension (3D for the world's
+    /// wind field), and is 2D when the title names none.
+    #[test]
+    fn null_uavs_keep_the_titles_dimension() {
+        let d = null_uav_desc(Some(8));
+        assert_eq!(d.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE3D);
+        // SAFETY: the member the dimension names.
+        assert_eq!(unsafe { d.Anonymous.Texture3D.WSize }, u32::MAX);
+        let d = null_uav_desc(Some(5));
+        assert_eq!(d.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE2DARRAY);
+        // SAFETY: the member the dimension names.
+        assert_eq!(unsafe { d.Anonymous.Texture2DArray.ArraySize }, 1);
+        let dimension = |d| null_uav_desc(d).ViewDimension;
+        assert_eq!(dimension(Some(2)), D3D12_UAV_DIMENSION_TEXTURE1D);
+        assert_eq!(dimension(Some(4)), D3D12_UAV_DIMENSION_TEXTURE2D);
+        assert_eq!(dimension(None), D3D12_UAV_DIMENSION_TEXTURE2D);
+        // Multisampled UAVs need a cap; they stay 2D.
+        assert_eq!(dimension(Some(6)), D3D12_UAV_DIMENSION_TEXTURE2D);
+    }
+
+    /// A null 3D UAV made on the real device leaves it alive.
+    #[test]
+    fn null_3d_uav_is_accepted_by_the_device() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let view = View::Unordered(0, 0, Some([28, 8, 0, 0, 0, 0, 0, 0, 0, 0]));
+        null_for(&view, heap.cpu(0));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
     fn dynamic_slots_are_held_until_released() {
