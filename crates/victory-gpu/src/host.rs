@@ -1007,6 +1007,11 @@ struct Deferred {
     copies: Vec<Step>,
     /// Post-submission readbacks from GPU textures into title buffers.
     readbacks: Vec<Readback>,
+    /// Title textures of the kinds copied back ([`crate::texback`]) that
+    /// the list's shaders write, copied when the list closes.
+    back_wanted: Vec<crate::texback::Target>,
+    /// Those copies, whose texels go to title memory once the list has run.
+    texture_backs: Vec<crate::texback::Back>,
     uploads: Vec<ID3D12Resource>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
@@ -1648,7 +1653,19 @@ impl Host {
                 copy_back(1, written as u64);
             }
         }
-        copy_back(0, copying.elapsed().as_micros() as u64);
+        let mut texback_count = 0u64;
+        let texback_started = std::time::Instant::now();
+        for list in runs {
+            for back in &list.deferred().texture_backs {
+                if crate::texback::land(back) {
+                    texback_count += 1;
+                }
+            }
+        }
+        if texback_count > 0 {
+            crate::texback::add_stats(texback_count, texback_started.elapsed().as_micros() as u64);
+        }
+        COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         // Host timestamps the lists resolved, on the title's GPU clock.
         let mut clock = None;
         for list in runs {
@@ -2064,6 +2081,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.textures_back();
         // The host closes no list with queries running; their title ends,
         // in a later list, are dropped (`end_query`).
         for (heap, kind, index, _) in self.queries.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
@@ -2176,6 +2194,49 @@ impl HostList {
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
                 (before != wanted).then_some(before)
+            }
+        }
+    }
+
+    /// A draw or dispatch being prepared writes title texture `resource`
+    /// through unordered access: if it is of a kind copied back
+    /// ([`crate::texback`]), the list copies it when it closes.
+    pub(crate) fn texture_written(&self, resource: crate::object::This) {
+        if !crate::texback::wanted(resource) {
+            return;
+        }
+        let mut deferred = self.deferred();
+        if !deferred
+            .back_wanted
+            .iter()
+            .any(|target| target.owner() == resource as usize)
+            && let Some(target) = crate::texback::Target::new(resource)
+        {
+            deferred.back_wanted.push(target);
+        }
+    }
+
+    /// Before the list closes: the textures its shaders wrote that are copied
+    /// back go into read-back buffers ([`crate::texback::record`]).
+    fn textures_back(&self) {
+        const COPY_SOURCE: u32 = 0x800;
+        let wanted = std::mem::take(&mut self.deferred().back_wanted);
+        for target in wanted {
+            if !target.is_valid() {
+                continue;
+            }
+            if let Some(before) = self.transition_copy(&target.copy, COPY_SOURCE) {
+                let after = legal_state(&target.copy.texture, COPY_SOURCE);
+                let barrier = transition(
+                    &target.copy.texture,
+                    D3D12_RESOURCE_STATES(before as i32),
+                    D3D12_RESOURCE_STATES(after as i32),
+                );
+                // SAFETY: an open list and a live texture.
+                unsafe { self.list.ResourceBarrier(&[barrier]) };
+            }
+            if let Some(back) = crate::texback::record(&self.list, target) {
+                self.deferred().texture_backs.push(back);
             }
         }
     }
@@ -3886,6 +3947,7 @@ impl Meter {
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
+        let (texback_count, texback_us) = crate::texback::take_stats();
         let [plans_ms, records_ms] =
             [0, 1].map(|i| BINDLESS_US[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
         let dropped = crate::draw::take_dropped() as f64 / frames;
@@ -3921,6 +3983,13 @@ impl Meter {
                 crate::descriptor::host::BACKLOG[1].load(Ordering::Relaxed),
                 making = crate::pipeline::making()
             );
+            if texback_count > 0 {
+                tracing::info!(
+                    per_frame = texback_count as f64 / frames,
+                    ms = texback_us as f64 / 1000.0 / frames,
+                    "texture readbacks (VICTORY_TEXTURE_BACK)"
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 tracing::info!(
