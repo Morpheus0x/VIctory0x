@@ -20,6 +20,8 @@ mod agility;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
+mod cardmeter;
+#[cfg(windows)]
 mod card;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -29,10 +31,14 @@ mod profile;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
+mod drvwatch;
+#[cfg(windows)]
 mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+pub mod framelog;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
