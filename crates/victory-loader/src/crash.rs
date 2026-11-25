@@ -27,7 +27,7 @@ use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
     GetModuleFileNameW, GetModuleHandleExW,
 };
-use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadStackLimits};
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 /// Frames listed per report.
@@ -670,7 +670,72 @@ fn module_of(address: usize) -> Option<String> {
     let len = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) };
     let path = String::from_utf16_lossy(&path[..len as usize]);
     let name = path.rsplit('\\').next().unwrap_or(&path);
-    Some(format!("{name}+{:#x}", address - module as usize))
+    let mut text = format!("{name}+{:#x}", address - module as usize);
+    if let Some(symbol) = symbol_at(address) {
+        text.push_str(&format!(" ({symbol})"));
+    }
+    Some(text)
+}
+
+/// The function, and its file and line when the build has them, at
+/// `address`, from the PDB beside the image (dbghelp searches the module's
+/// directory). None when there is no PDB or dbghelp does not load: the
+/// report then keeps the module and offset.
+fn symbol_at(address: usize) -> Option<String> {
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        IMAGEHLP_LINE64, SYMBOL_INFO, SYMOPT_DEFERRED_LOADS, SYMOPT_LOAD_LINES, SYMOPT_UNDNAME,
+        SymFromAddr, SymGetLineFromAddr64, SymInitialize, SymSetOptions,
+    };
+    static READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !READY.swap(true, Ordering::Relaxed) {
+        // SAFETY: dbghelp on this process; loaded once, for the process's
+        // life, and the crash path runs it once.
+        let ok = unsafe {
+            SymSetOptions(SYMOPT_UNDNAME | SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS);
+            SymInitialize(GetCurrentProcess(), std::ptr::null(), 1) != 0
+        };
+        LOADED.store(ok, Ordering::Relaxed);
+    }
+    if !LOADED.load(Ordering::Relaxed) {
+        return None;
+    }
+    // `SYMBOL_INFO` ends in `Name[1]`: lend it a buffer with room for the
+    // longest name, 8-byte aligned as the struct requires.
+    const NAME: usize = 512;
+    let mut words = vec![0u64; size_of::<SYMBOL_INFO>().div_ceil(8) + NAME / 8];
+    let info = words.as_mut_ptr().cast::<SYMBOL_INFO>();
+    // SAFETY: the buffer is large enough for the struct and its name.
+    let name = unsafe {
+        (*info).SizeOfStruct = size_of::<SYMBOL_INFO>() as u32;
+        (*info).MaxNameLen = NAME as u32;
+        let mut displacement = 0u64;
+        if SymFromAddr(GetCurrentProcess(), address as u64, &mut displacement, info) == 0 {
+            return None;
+        }
+        let name = std::slice::from_raw_parts((*info).Name.as_ptr().cast::<u8>(), (*info).NameLen as usize);
+        String::from_utf8_lossy(name).into_owned()
+    };
+    let mut line: IMAGEHLP_LINE64 = Default::default();
+    line.SizeOfStruct = size_of::<IMAGEHLP_LINE64>() as u32;
+    let mut column = 0u32;
+    // SAFETY: the struct is sized and zeroed as the call requires.
+    let at = unsafe {
+        (SymGetLineFromAddr64(GetCurrentProcess(), address as u64, &mut column, &mut line) != 0
+            && !line.FileName.is_null())
+        .then(|| {
+            let file = std::ffi::CStr::from_ptr(line.FileName.cast()).to_string_lossy();
+            format!(
+                "{}:{}",
+                file.rsplit(['\\', '/']).next().unwrap_or(&file),
+                line.LineNumber
+            )
+        })
+    };
+    Some(match at {
+        Some(at) => format!("{name} at {at}"),
+        None => name,
+    })
 }
 
 /// What is at `address`, for an access violation there: nothing, memory
@@ -721,6 +786,14 @@ mod tests {
     use windows_sys::Win32::System::Diagnostics::Debug::{
         EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
     };
+
+    #[test]
+    fn a_frame_is_named_from_its_pdb() {
+        // SAFETY: a function's own address, inside this test's image.
+        let at = symbol_at as usize;
+        let named = symbol_at(at).expect("dbghelp names a frame of this test's image");
+        assert!(named.contains("symbol_at"), "{named}");
+    }
 
     #[test]
     #[inline(never)]
