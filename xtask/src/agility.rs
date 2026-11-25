@@ -4,8 +4,8 @@
 //! translated pipeline needs (issue #84). victory.exe asks D3D12 for a newer
 //! runtime (`apps/victory/src/agility.rs`); this puts Microsoft's
 //! `D3D12Core.dll`, and the debug layer's `d3d12SDKLayers.dll`, where it
-//! looks: `<target>/<profile>/D3D12/`. `victory-shader`'s test executables
-//! use it from there too (`crates/victory-shader/src/agility.rs`).
+//! looks: `<target>/<profile>/D3D12/`. `victory-shader`'s and `victory-gpu`'s test
+//! executables use it from there too (their `src/agility.rs`).
 //!
 //! The DLLs are Microsoft's, so they never enter the repository (asset
 //! policy): they are fetched from nuget.org, at a pinned version whose
@@ -18,8 +18,8 @@ use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha512};
 
 /// The package version. Its minor number is `D3D12SDKVersion` in
-/// `apps/victory/src/agility.rs` and `crates/victory-shader/src/agility.rs`:
-/// keep the three in step.
+/// `apps/victory/src/agility.rs` and the `src/agility.rs` of `victory-shader`
+/// and `victory-gpu`: keep the four in step.
 const VERSION: &str = "1.620.2";
 /// The package's SHA-512, as nuget.org's catalog gives it (base64
 /// `1oP/f1cm…MnNQ==`).
@@ -48,15 +48,18 @@ pub fn run(root: &Path, target: &Path) -> Result<()> {
         }
         println!("D3D12 Agility SDK {VERSION}: {}", dir.display());
     }
-    // victory-shader's build script exports the runtime to its tests only
-    // when it is there, and does not watch for it while it is missing (that
-    // would rebuild the crate every time): make cargo rerun it.
-    let script = root.join("crates/victory-shader/build.rs");
-    std::fs::File::options()
-        .append(true)
-        .open(&script)
-        .and_then(|f| f.set_modified(std::time::SystemTime::now()))
-        .with_context(|| format!("touching {}", script.display()))?;
+    // victory-shader's and victory-gpu's build scripts export the runtime to
+    // their tests only when it is there, and do not watch for it while it is
+    // missing (that would rebuild the crates every time): make cargo rerun
+    // them.
+    for crate_ in ["victory-shader", "victory-gpu"] {
+        let script = root.join("crates").join(crate_).join("build.rs");
+        std::fs::File::options()
+            .append(true)
+            .open(&script)
+            .and_then(|f| f.set_modified(std::time::SystemTime::now()))
+            .with_context(|| format!("touching {}", script.display()))?;
+    }
     Ok(())
 }
 
@@ -228,6 +231,10 @@ mod tests {
             (
                 "crates/victory-shader/src/agility.rs",
                 include_str!("../../crates/victory-shader/src/agility.rs"),
+            ),
+            (
+                "crates/victory-gpu/src/agility.rs",
+                include_str!("../../crates/victory-gpu/src/agility.rs"),
             ),
         ] {
             assert!(
