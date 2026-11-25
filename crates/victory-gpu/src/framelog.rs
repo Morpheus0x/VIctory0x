@@ -5,6 +5,13 @@
 //!
 //! On by default in `diagnostics` builds; set `VICTORY_FRAME_LOG=1` or `0` to
 //! override. Unconfigured builds still pay only plain relaxed atomic adds.
+//!
+//! One reading every five seconds: counts, percentiles and the usual frame,
+//! then at most `LONG_MOST` long frames. `VICTORY_FRAME_LOG_EACH=1` also
+//! appends every frame's duration (off: at menu frame rates the list runs to
+//! thousands of numbers). `VICTORY_FRAME_LOG_FILE=<path>` appends readings to
+//! that file instead of the process log, so the frame log can be kept apart
+//! from a verbose `VICTORY_LOG`.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -394,24 +401,38 @@ fn long_over(usual: f64) -> f64 {
     (usual * 1.5).max(usual + 40_000.0)
 }
 
-fn lines(frames: &[Frame], usual: f64, seconds: f64) -> Vec<String> {
+fn lines(frames: &[Frame], usual: f64, seconds: f64, each: bool) -> Vec<String> {
     let over = long_over(usual);
     let (long, plain): (Vec<&Frame>, Vec<&Frame>) = frames.iter().partition(|f| f.us > over);
-    let each: Vec<String> = frames.iter().map(|f| format!("{:.0}", f.us / 1e3)).collect();
     let shortest = frames.iter().map(|f| f.us).fold(f64::INFINITY, f64::min);
     let longest = frames.iter().map(|f| f.us).fold(0.0, f64::max);
-    let mut out = vec![format!(
-        "frame times: {} frames in {seconds:.1} s: shortest {:.0} ms, median {:.0}, longest {:.0}; \
-         {} long (over {:.0} ms, the usual frame of the last {RECENT} being {:.0}); each: {}",
+    let mut sorted: Vec<f64> = frames.iter().map(|f| f.us).collect();
+    sorted.sort_by(f64::total_cmp);
+    let percentile = |p: f64| {
+        if sorted.is_empty() {
+            0.0
+        } else {
+            sorted[((sorted.len() - 1) as f64 * p).round() as usize]
+        }
+    };
+    let mut header = format!(
+        "frame times: {} frames in {seconds:.1} s: shortest {:.0} ms, median {:.0}, p95 {:.0}, \
+         longest {:.0}; {} long (over {:.0} ms, the usual frame of the last {RECENT} being {:.0})",
         frames.len(),
         shortest / 1e3,
         median(frames.iter().map(|f| f.us)) / 1e3,
+        percentile(0.95) / 1e3,
         longest / 1e3,
         long.len(),
         over / 1e3,
-        usual / 1e3,
-        each.join(" ")
-    )];
+        usual / 1e3
+    );
+    if each {
+        let each: Vec<String> = frames.iter().map(|f| format!("{:.0}", f.us / 1e3)).collect();
+        header.push_str("; each: ");
+        header.push_str(&each.join(" "));
+    }
+    let mut out = vec![header];
     if !plain.is_empty() {
         out.push(format!(
             "usual frame (the mean of {} not long): {}",
@@ -497,9 +518,47 @@ pub fn frame() {
         state.recent.push_back(f.us);
     }
     let usual = median(state.recent.iter().copied());
-    for line in lines(&frames, usual, elapsed.as_secs_f64()) {
-        tracing::info!("{line}");
+    for line in lines(&frames, usual, elapsed.as_secs_f64(), each_enabled()) {
+        emit(&line);
     }
+}
+
+/// `VICTORY_FRAME_LOG_EACH=1` appends every frame's duration to the reading.
+/// Off by default: at menu frame rates the list is thousands of numbers.
+fn each_enabled() -> bool {
+    std::env::var_os("VICTORY_FRAME_LOG_EACH").is_some_and(|v| v == "1")
+}
+
+/// Writes one reading line: to `VICTORY_FRAME_LOG_FILE` when set (created,
+/// appended), so the frame log does not grow the main run log; otherwise to
+/// the normal tracing output.
+fn emit(line: &str) {
+    use std::io::Write;
+    static SINK: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let sink = SINK.get_or_init(|| {
+        let path = std::path::PathBuf::from(std::env::var_os("VICTORY_FRAME_LOG_FILE")?);
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(file) => Some(Mutex::new(file)),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "frame log file: falling back to tracing");
+                None
+            }
+        }
+    });
+    if let Some(file) = sink
+        && let Ok(mut file) = file.lock()
+        && writeln!(file, "{line}").is_ok()
+    {
+        return;
+    }
+    tracing::info!("{line}");
 }
 
 #[cfg(test)]
@@ -527,16 +586,16 @@ mod tests {
             .enumerate()
             .map(|(i, &ms)| frame(i as u64, ms))
             .collect();
-        let out = lines(&frames, 150_000.0, 1.0);
+        let out = lines(&frames, 150_000.0, 1.0, false);
         assert_eq!(out.len(), 3, "{out:#?}");
         assert!(
             out[0].starts_with(
-                "frame times: 5 frames in 1.0 s: shortest 140 ms, median 150, longest 400; 1 long (over 225 ms"
+                "frame times: 5 frames in 1.0 s: shortest 140 ms, median 150, p95 400, longest 400; 1 long (over 225 ms"
             ),
             "{}",
             out[0]
         );
-        assert!(out[0].ends_with("each: 150 160 140 400 150"), "{}", out[0]);
+        assert!(!out[0].contains("each:"), "{}", out[0]);
         assert!(
             out[1].starts_with("usual frame (the mean of 4 not long): 150 ms |"),
             "{}",
@@ -554,6 +613,19 @@ mod tests {
     }
 
     #[test]
+    fn every_frame_is_listed_only_on_request() {
+        let frames: Vec<Frame> = [150.0, 160.0, 140.0]
+            .iter()
+            .enumerate()
+            .map(|(i, &ms)| frame(i as u64, ms))
+            .collect();
+        let out = lines(&frames, 150_000.0, 1.0, true);
+        assert!(out[0].ends_with("each: 150 160 140"), "{}", out[0]);
+        let quiet = lines(&frames, 150_000.0, 1.0, false);
+        assert!(!quiet[0].contains("each:"), "{}", quiet[0]);
+    }
+
+    #[test]
     fn long_is_half_as_long_again_and_at_least_40_ms_more() {
         assert_eq!(long_over(150_000.0), 225_000.0);
         assert_eq!(long_over(30_000.0), 70_000.0);
@@ -562,7 +634,7 @@ mod tests {
     #[test]
     fn more_long_frames_than_are_listed_are_counted() {
         let exact: Vec<Frame> = (0..LONG_MOST).map(|i| frame(i as u64, 500.0)).collect();
-        let exact_out = lines(&exact, 100_000.0, 5.0);
+        let exact_out = lines(&exact, 100_000.0, 5.0, false);
         assert_eq!(
             exact_out.iter().filter(|l| l.starts_with("long frame ")).count(),
             LONG_MOST
@@ -570,7 +642,7 @@ mod tests {
         assert!(!exact_out.iter().any(|l| l.starts_with("long frames:")));
         let mut frames: Vec<Frame> = (0..12).map(|i| frame(i, 500.0)).collect();
         frames.push(frame(12, 100.0));
-        let out = lines(&frames, 100_000.0, 5.0);
+        let out = lines(&frames, 100_000.0, 5.0, false);
         assert_eq!(
             out.iter().filter(|l| l.starts_with("long frame ")).count(),
             LONG_MOST
@@ -605,7 +677,7 @@ mod tests {
         assert_eq!(long_over(0.0), 40_000.0);
         assert_eq!(long_over(100_000.0), 150_000.0);
         // Boundary: equal to `long_over(100_000.0) == 150_000.0` is not marked long (`>` strict).
-        let boundary = lines(&[frame(0, 150.0)], 100_000.0, 1.0);
+        let boundary = lines(&[frame(0, 150.0)], 100_000.0, 1.0, false);
         assert!(boundary[0].contains("0 long"), "{}", boundary[0]);
         assert!(boundary.iter().all(|l| !l.starts_with("long frame")));
 
