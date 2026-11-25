@@ -23,6 +23,8 @@ mod lightprobe;
 mod texlate;
 #[cfg(windows)]
 mod texstore;
+#[cfg(all(test, windows))]
+mod agility;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
