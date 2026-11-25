@@ -1152,6 +1152,22 @@ mod host {
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
+            // A Steam Controller is a Valve HID device, not an XInput one; it
+            // plays slot 0 itself so a Steam-created virtual pad cannot take
+            // the slot from it.
+            if slot == 0
+                && let Some(pad) = super::super::steam::latest()
+            {
+                return Some(PadState {
+                    buttons: pad.buttons,
+                    left_trigger: pad.left_trigger,
+                    right_trigger: pad.right_trigger,
+                    left_x: pad.left_x,
+                    left_y: pad.left_y,
+                    right_x: pad.right_x,
+                    right_y: pad.right_y,
+                });
+            }
             let empty = self.empty_until[slot].is_some_and(|until| Instant::now() < until);
             if !empty {
                 let mut state = XINPUT_STATE::default();
