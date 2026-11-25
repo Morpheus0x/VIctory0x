@@ -772,6 +772,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
     let started = std::time::Instant::now();
     crate::framelog::add(crate::framelog::T::Remaps, 1);
+    crate::texback::remapped(at, len);
     let end = at.saturating_add(len);
     {
         let mut g = guards();
