@@ -100,6 +100,21 @@ pub(crate) fn host_shader(container: &[u8], target: Target) -> Result<HostShader
     }
 }
 
+/// The offline warm-up (`victory translate --warm`): `container` is
+/// translated for `target` into the cache unless it is there already.
+/// `Ok(true)`: translated now. Needs [`use_shader_cache`]; `target` must be
+/// what the run's host reports (its log's "host wave sizes").
+pub fn warm(container: &[u8], lanes: (u32, u32)) -> Result<bool, String> {
+    let target = Target { lanes_min: lanes.0, lanes_max: lanes.1 };
+    let cache = CACHE.get().ok_or("no shader cache")?;
+    let ran = AtomicBool::new(false);
+    let translate = |c: &[u8]| {
+        ran.store(true, Ordering::Relaxed);
+        victory_shader::emit::translate_for(c, target).map_err(|e| e.to_string())
+    };
+    cached(cache, &key(build(), target), container, translate).map(|_| ran.load(Ordering::Relaxed))
+}
+
 /// The part of an entry's key before the container: the build, and the
 /// host's wave sizes (a translation for one host's waves is not another's).
 fn key(build: &[u8; 32], target: Target) -> [u8; 32] {

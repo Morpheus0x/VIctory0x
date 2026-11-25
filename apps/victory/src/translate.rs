@@ -154,6 +154,67 @@ struct Checks {
     host: Option<(Host, emit::HostShader)>,
 }
 
+/// `translate --warm`: every container found is translated into the run's
+/// shader cache (the configured cache folder, `VICTORY_CACHE_DIR`), for
+/// this host's wave sizes; nothing else is checked.
+pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, host_lanes: Option<(u32, u32)>) -> Result<()> {
+    let target = match host_lanes {
+        Some((lanes_min, lanes_max)) => emit::Target { lanes_min, lanes_max },
+        None => Host::new(false).map_err(anyhow::Error::msg)?.target(),
+    };
+    println!("host waves   {}-{} lanes", target.lanes_min, target.lanes_max);
+    let cfg = victory_core::Config::load()?;
+    let dir = cfg.cache_subdir("shaders")?;
+    println!("shader cache {}", dir.display());
+    victory_hle::modules::d3d12x::use_shader_cache(dir);
+    let paths = crate::default_paths(paths)?;
+    let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let began = std::time::Instant::now();
+    let seen = Mutex::new(HashSet::new());
+    let counts = [const { AtomicUsize::new(0) }; 4];
+    for root in &paths {
+        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+                continue;
+            }
+            let Ok(data) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let jobs = sources(&data);
+            let next = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..threads.min(jobs.len()) {
+                    s.spawn(|| {
+                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            let Some(bytes) = job.bytes() else { continue };
+                            if !lock(&seen).insert(*blake3::hash(&bytes).as_bytes()) {
+                                continue;
+                            }
+                            let n = counts[3].fetch_add(1, Ordering::Relaxed) + 1;
+                            if n.is_multiple_of(1000) {
+                                println!("warm-up      {n} shaders so far, {:.0} s", began.elapsed().as_secs_f64());
+                            }
+                            let which = match victory_hle::modules::d3d12x::warm_shader(&bytes, (target.lanes_min, target.lanes_max)) {
+                                Ok(true) => 0,
+                                Ok(false) => 1,
+                                Err(_) => 2,
+                            };
+                            counts[which].fetch_add(1, Ordering::Relaxed);
+                        }
+                    });
+                }
+            });
+        }
+    }
+    let [now, there, failed] = [0, 1, 2].map(|i| counts[i].load(Ordering::Relaxed));
+    println!(
+        "warm-up      {} found: {now} translated now, {there} in the cache already, {failed} do not translate; {:.1} s on {threads} threads",
+        now + there + failed,
+        began.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,

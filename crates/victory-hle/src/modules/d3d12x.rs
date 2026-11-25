@@ -49,6 +49,21 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     let _ = dir;
 }
 
+/// The offline warm-up (`victory translate --warm`): `container` is
+/// translated into the cache for a host of `lanes` (min, max) wave lanes.
+/// `Ok(true)`: translated now; `Ok(false)`: it was there.
+pub fn warm_shader(container: &[u8], lanes: (u32, u32)) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::warm(container, lanes)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (container, lanes);
+        Err("no shader cache on this host".into())
+    }
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "d3d12x",
