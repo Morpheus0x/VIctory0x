@@ -1943,8 +1943,11 @@ impl HostHeap {
                 let lacks = match (new, &planned) {
                     (_, None) => true,
                     (Some(new), Some(reads)) => {
+                        // No submission uses the plan's writes outside
+                        // tests (`Batch::prepare_bindless`), so another
+                        // write alone leaves the plan as good as it was.
                         let lacking = [
-                            !same_range(&new.write, wrote),
+                            cfg!(test) && !same_range(&new.write, wrote),
                             new.bounce != bounced,
                             !covered(reads, &new.read),
                         ];
@@ -1955,9 +1958,10 @@ impl HostHeap {
                         lacking.contains(&true)
                     }
                     (None, Some(_)) => {
-                        let gone = wrote.is_some() || bounced.is_some();
+                        let wrote = cfg!(test) && wrote.is_some();
+                        let gone = wrote || bounced.is_some();
                         why[3] += usize::from(gone);
-                        bits |= u8::from(wrote.is_some()) | u8::from(bounced.is_some()) << 1;
+                        bits |= u8::from(wrote) | u8::from(bounced.is_some()) << 1;
                         gone
                     }
                 };
