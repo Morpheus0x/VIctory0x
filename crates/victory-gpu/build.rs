@@ -50,9 +50,9 @@ fn main() {
         let core = profile.join("D3D12").join("D3D12Core.dll");
         let msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
         if msvc && core.exists() {
+            println!("cargo::rustc-check-cfg=cfg(agility_runtime)");
+            println!("cargo::rustc-cfg=agility_runtime");
             println!("cargo::rerun-if-changed={}", core.display());
-            println!("cargo::rustc-link-arg=/EXPORT:D3D12SDKVersion,DATA");
-            println!("cargo::rustc-link-arg=/EXPORT:D3D12SDKPath,DATA");
         } else {
             println!("cargo::rerun-if-changed=build.rs");
         }
