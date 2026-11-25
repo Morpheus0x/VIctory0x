@@ -3,7 +3,7 @@
 //! Windows 10's in-box D3D12 stops at shader model 6.5, so the tests that
 //! run translated shaders on a host device found none there. D3D12 looks
 //! for these two exports on the process's executable, as for `victory.exe`
-//! (`apps/victory/src/agility.rs`); `build.rs` exports them only when the
+//! (`apps/victory/src/agility.rs`); they are exported (below) only when the
 //! runtime `cargo xtask agility` fetches is in `<target>/<profile>/D3D12/`.
 //! Unexported, they are inert.
 #![allow(non_upper_case_globals)]
@@ -24,3 +24,13 @@ unsafe impl Sync for SdkPath {}
 /// are in `<profile>/deps/`, the runtime in `<profile>/D3D12/`.
 #[unsafe(no_mangle)]
 pub static D3D12SDKPath: SdkPath = SdkPath(c"..\\D3D12\\".as_ptr());
+
+/// The linker directive that exports the two statics above, when the runtime
+/// is staged (`build.rs`). It lives in this test-only module, so only the
+/// crate's unit-test executable carries it: the integration tests link the
+/// library without this module, and an export of a symbol they lack would
+/// not link.
+#[cfg(agility_runtime)]
+#[used]
+#[unsafe(link_section = ".drectve")]
+static EXPORTS: [u8; 56] = *b" /EXPORT:D3D12SDKVersion,DATA /EXPORT:D3D12SDKPath,DATA ";
