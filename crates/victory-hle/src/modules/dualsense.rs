@@ -287,8 +287,12 @@ fn device_paths() -> Vec<Vec<u16>> {
         while unsafe { *path.add(len) } != 0 {
             len += 1;
         }
+        // With its NUL: `CreateFileW` reads up to it (without one it read
+        // past the end of the copy and stopped the run, 2026-11-25).
         // SAFETY: `path` is valid for `len` u16s in the live buffer.
-        paths.push(unsafe { std::slice::from_raw_parts(path, len) }.to_vec());
+        let mut owned = unsafe { std::slice::from_raw_parts(path, len) }.to_vec();
+        owned.push(0);
+        paths.push(owned);
     }
     // SAFETY: the set is ours.
     unsafe { SetupDiDestroyDeviceInfoList(set) };
