@@ -969,6 +969,23 @@ impl Module {
                 mark(&mut live, &mut work, v)
             });
         }
+        // Diagnostics (`VICTORY_SHADER_OPT_TRACE=1`): the calls that leave,
+        // by function, on the error output.
+        if std::env::var_os("VICTORY_SHADER_OPT_TRACE").is_some() {
+            let mut gone: std::collections::BTreeMap<String, u32> = Default::default();
+            for (b, blk) in self.blocks.iter().enumerate() {
+                for &i in blk.body.iter().filter(|&&i| !reached[b] || !live[i as usize]) {
+                    let what = match &self.insts[i as usize].op {
+                        Op::Call(f, _) => self.funcs[*f as usize].name.clone(),
+                        Op::Load(_) => "load".into(),
+                        Op::Alloca(..) => "alloca".into(),
+                        _ => continue,
+                    };
+                    *gone.entry(what).or_default() += 1;
+                }
+            }
+            eprintln!("clean-up: calls dropped as dead: {gone:?}");
+        }
         for (b, blk) in self.blocks.iter_mut().enumerate() {
             if reached[b] {
                 blk.body.retain(|&i| live[i as usize]);
