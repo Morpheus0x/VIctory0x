@@ -91,6 +91,10 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Only translate every shader into the run's shader cache, for
+        /// this host's wave sizes (or --host-lanes), and report counts.
+        #[arg(long)]
+        warm: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -160,7 +164,14 @@ fn main() -> Result<()> {
             list,
             jobs,
             host_lanes,
-        } => translate::run(paths, validate, pipelines, list, jobs, host_lanes),
+            warm,
+        } => {
+            if warm {
+                translate::warm(paths, jobs, host_lanes)
+            } else {
+                translate::run(paths, validate, pipelines, list, jobs, host_lanes)
+            }
+        }
         Command::Run {
             exe,
             unimplemented,
