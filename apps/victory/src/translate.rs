@@ -168,7 +168,8 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, host_lanes: Option<(u32, u
     println!("shader cache {}", dir.display());
     victory_hle::modules::d3d12x::use_shader_cache(dir);
     let paths = crate::default_paths(paths)?;
-    let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    anyhow::ensure!(jobs != Some(0), "--jobs 0 would start no worker: give 1 or more");
+    let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get())).max(1);
     let began = std::time::Instant::now();
     let seen = Mutex::new(HashSet::new());
     let counts = [const { AtomicUsize::new(0) }; 4];
