@@ -1565,4 +1565,32 @@ mod tests {
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
     }
+
+    #[test]
+    fn lanes_count_accumulates_completed_requests_and_bytes() {
+        let mut lanes = Lanes {
+            lanes: HashMap::new(),
+            next_id: 0,
+            next_seq: 0,
+            staged: 0,
+            staging: STAGING,
+            starved: false,
+            clock: [0; 3],
+            now: 0,
+            lane_now: [0; 3],
+            done: Default::default(),
+            refused: 0,
+            bcpack: Default::default(),
+            since: Some(Instant::now()),
+        };
+        let job = Job {
+            lane: 0,
+            seq: 0,
+            request: request(0, std::ptr::null_mut(), 4096, std::ptr::null(), 0, 4096),
+            staging: 0,
+        };
+        lanes.count(&job, Instant::now());
+        assert_eq!(lanes.done.0, 1);
+        assert_eq!(lanes.done.1, 4096);
+    }
 }

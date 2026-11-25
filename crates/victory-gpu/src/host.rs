@@ -1577,7 +1577,7 @@ impl Host {
                 plan.clear_pending();
             }
         }
-        COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        copy_back(0, copying.elapsed().as_micros() as u64);
         self.finish_submission(runs, cpu_back);
         self.log_messages();
     }
