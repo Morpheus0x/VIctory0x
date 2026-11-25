@@ -118,11 +118,27 @@ fn keep() -> f32 {
 /// its name: a small image of the whole sky, in the light's own units.
 pub(crate) const SKY: &[u8] = b"ps_sky_paraboloid_reflection";
 
-/// The image that program last drew into.
-static SKY_IMAGE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The sky dome that program last drew into: the host copy, held, since
+/// the title's object may go at any time.
+///
+/// The program draws twice a frame, on two lists recorded at once: the dome
+/// (128x128, R16G16B16A16_FLOAT) and another image of the sky (R11G11B10).
+/// Following whichever was recorded last made the light jump between the
+/// two, three times apart, from frame to frame (run don1, 2026-11-25).
+static SKY_IMAGE: std::sync::Mutex<Option<std::sync::Arc<crate::resource::HostTexture>>> =
+    std::sync::Mutex::new(None);
 
 pub(crate) fn sky_drawn(image: usize) {
-    SKY_IMAGE.store(image, Ordering::Relaxed);
+    let Some(copy) = crate::resource::host_copy(image as This) else { return };
+    // SAFETY: a live resource.
+    let d = unsafe { copy.texture.GetDesc() };
+    if d.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        return;
+    }
+    let mut held = SKY_IMAGE.lock().unwrap_or_else(|e| e.into_inner());
+    if !held.as_ref().is_some_and(|h| std::sync::Arc::ptr_eq(h, &copy)) {
+        *held = Some(copy);
+    }
 }
 
 /// The light follows the sky: its level and colour are the sky image's mean
@@ -490,9 +506,9 @@ fn record(list: &HostList, light: This, depth: Option<This>, held: f32) -> bool 
     });
     let slot = pass.next.fetch_add(1, Ordering::Relaxed) % SLOTS * 3;
     // The sky image, if the light follows it and the title has drawn it.
-    let sky_image = SKY_IMAGE.load(Ordering::Relaxed) as This;
+    let sky_image = SKY_IMAGE.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let sky = follow().and_then(|f| {
-        let t = crate::resource::host_resource(sky_image)?;
+        let t = &sky_image.as_ref()?.texture;
         // SAFETY: a live resource.
         let d = unsafe { t.GetDesc() };
         static SEEN: std::sync::Once = std::sync::Once::new();
@@ -505,18 +521,24 @@ fn record(list: &HostList, light: This, depth: Option<This>, held: f32) -> bool 
                 "the sky image the ambient light would follow"
             );
         });
-        let known = [DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R11G11B10_FLOAT].contains(&d.Format);
-        (known && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D).then_some((t, f, d.Format))
+        Some((t, f, d.Format))
     });
     static FOLLOWS: std::sync::Once = std::sync::Once::new();
     if let Some((t, f, _)) = sky {
         FOLLOWS.call_once(|| tracing::info!(gain = f[0], least = f[1], power = f[2], "ambient light follows the sky"));
         list.keep(t);
-        crate::list::ensure_state(
-            list,
-            sky_image,
-            (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0) as u32,
-        );
+        let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0;
+        if let Some(copy) = &sky_image
+            && let Some(before) = list.transition_copy(copy, read as u32)
+        {
+            let barrier = crate::host::transition(
+                t,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATES(read),
+            );
+            // SAFETY: an open list and a live texture the list keeps.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
     }
     list.keep(light);
     // The depth the resolve just read, in the state it read it in; of the
