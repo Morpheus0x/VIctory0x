@@ -1579,16 +1579,27 @@ mod state {
         one_range: i32,
         depth: *const u64,
     ) {
-        let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
+        let mut stack = [0u64; 8];
+        let mut overflow = Vec::new();
+        let handles: &[u64] = if one_range != 0 && !handles.is_null() {
             // SAFETY: the title passes the first handle.
             let first = unsafe { *handles };
-            (0..u64::from(count)).map(|i| first + 128 * i).collect()
+            let n = count as usize;
+            if n <= stack.len() {
+                for (i, slot) in stack[..n].iter_mut().enumerate() {
+                    *slot = first + 128 * i as u64;
+                }
+                &stack[..n]
+            } else {
+                overflow = (0..u64::from(count)).map(|i| first + 128 * i).collect();
+                &overflow
+            }
         } else {
-            items(handles, count).to_vec()
+            items(handles, count)
         };
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
-        with_state(this, |list, s| s.set_targets(list, &handles, depth));
+        with_state(this, |list, s| s.set_targets(list, handles, depth));
     }
     pub(super) extern "system" fn draw(
         this: This,

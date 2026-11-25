@@ -8,6 +8,7 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
+use victory_shader::RootType;
 use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -379,6 +380,9 @@ pub(crate) struct HostPipeline {
     /// Draws rectangle lists as they are, through a geometry shader that
     /// adds the fourth vertex.
     pub(crate) rectangles: bool,
+    pub(crate) by_address: bool,
+    pub(crate) resource_heap: bool,
+    pub(crate) writes_memory: bool,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
 }
@@ -441,8 +445,19 @@ impl HostPipeline {
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
+        let mut by_address = false;
+        let mut resource_heap = false;
+        let mut writes_memory = false;
         for &(shader, visibility) in &stages {
-            let t = &shader.translated()?.host;
+            let tr = shader.translated()?;
+            by_address |= tr
+                .host
+                .user_data
+                .iter()
+                .any(|u| u.root == RootType::MEMORY);
+            resource_heap |= tr.resource_heap;
+            writes_memory |= tr.writes_memory;
+            let t = &tr.host;
             let mut stage = Stage {
                 shader: shader.clone(),
                 user_data: None,
@@ -584,6 +599,9 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 rectangles: false,
+                by_address,
+                resource_heap,
+                writes_memory,
             });
         }
         let Some(g) = g else {
@@ -632,6 +650,9 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 rectangles: false,
+                by_address,
+                resource_heap,
+                writes_memory,
             });
         }
 
@@ -740,6 +761,9 @@ impl HostPipeline {
             slots: g.slots(),
             inputs: g.elements(),
             rectangles: gs.is_some(),
+            by_address,
+            resource_heap,
+            writes_memory,
         })
     }
 }

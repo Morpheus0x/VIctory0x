@@ -5,7 +5,7 @@
 //! overlap them with per-submission fences once more than clears run.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
@@ -1631,7 +1631,7 @@ impl Host {
             for rb in &list.deferred().readbacks {
                 let written = if rb.dst_pitch == rb.row_bytes && rb.src_pitch == rb.row_bytes {
                     let bytes = rb.row_bytes * rb.lines;
-                    crate::watch::writing(rb.dst, bytes);
+                    crate::watch::open_for_write(rb.dst, bytes);
                     write_mapped(rb.dst as *mut u8, rb.src as *const u8, bytes);
                     bytes
                 } else {
@@ -1639,7 +1639,7 @@ impl Host {
                     for line in 0..rb.lines {
                         let to = rb.dst + line * rb.dst_pitch;
                         let from = rb.src + line * rb.src_pitch;
-                        crate::watch::writing(to, rb.row_bytes);
+                        crate::watch::open_for_write(to, rb.row_bytes);
                         write_mapped(to as *mut u8, from as *const u8, rb.row_bytes);
                         n += rb.row_bytes;
                     }
@@ -2504,9 +2504,10 @@ impl HostList {
     }
 
     /// Room for `bytes` of clamped indirect arguments in this list's
-    /// buffers, writable by shaders from here on in the list: the buffer and
-    /// the offset. None for more than a buffer holds.
-    pub(crate) fn clamp_room(&self, bytes: u64) -> Option<(ID3D12Resource, u64)> {
+    /// buffers, writable by shaders from here on in the list: the buffer,
+    /// the offset, and whether the clamp root/PSO/budget need binding.
+    /// None for more than a buffer holds.
+    pub(crate) fn clamp_room(&self, bytes: u64) -> Option<(ID3D12Resource, u64, bool)> {
         const CHUNK: u64 = 256 << 10;
         let bytes = bytes.next_multiple_of(16);
         if bytes > CHUNK {
@@ -2516,7 +2517,9 @@ impl HostList {
         if chunks.used > 0 && chunks.at + bytes <= CHUNK {
             let at = chunks.at;
             chunks.at += bytes;
-            return Some((chunks.all[chunks.used - 1].0.clone(), at));
+            let bind = !chunks.bound;
+            chunks.bound = true;
+            return Some((chunks.all[chunks.used - 1].0.clone(), at, bind));
         }
         // The next buffer, writable.
         if chunks.used == chunks.all.len() {
@@ -2527,6 +2530,8 @@ impl HostList {
         let i = chunks.used;
         chunks.used += 1;
         chunks.at = bytes;
+        let bind = !chunks.bound;
+        chunks.bound = true;
         let mut barriers = Vec::new();
         if !chunks.barrier {
             // What earlier lists' shaders wrote first.
@@ -2546,7 +2551,7 @@ impl HostList {
             // SAFETY: an open list and live buffers.
             unsafe { self.list.ResourceBarrier(&barriers) };
         }
-        Some((buffer, 0))
+        Some((buffer, 0, bind))
     }
 
     /// Whether the list's clamps still have to bind their root signature,
@@ -2904,7 +2909,9 @@ impl HostList {
                 }
                 Step::GpuWrite(shadow, address, len) => {
                     // The shaders start from the title's data.
-                    batch.flush();
+                    if batch.needs_flush(shadow, *address, *len) {
+                        batch.flush();
+                    }
                     shadow.writing(*address, *len);
                 }
                 Step::Texture(staging, copy) => {
@@ -2958,6 +2965,25 @@ struct Batch {
 }
 
 impl Batch {
+    fn needs_flush(&self, shadow: &crate::shadow::Shadow, address: usize, len: usize) -> bool {
+        if len == 0 || (self.refreshes.is_empty() && self.pieces.is_empty()) {
+            return false;
+        }
+        let key = shadow.root_key();
+        let page_lo = address / crate::watch::PAGE;
+        let page_hi = (address + len).div_ceil(crate::watch::PAGE);
+        let overlaps = |a: usize, b: usize| {
+            a < b && a / crate::watch::PAGE < page_hi && b.div_ceil(crate::watch::PAGE) > page_lo
+        };
+        self.refreshes
+            .iter()
+            .any(|(s, a, b)| s.root_key() == key && overlaps(*a, *b))
+            || self
+                .pieces
+                .iter()
+                .any(|(s, a, b)| s.root_key() == key && overlaps(*a, *b))
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         if shadow.is_sparse() {
@@ -3169,31 +3195,144 @@ impl Early {
     }
 }
 
-/// Runs `f` on pieces of `list`, of `least` items or more, on some threads.
-pub(crate) fn in_parallel<T: Sync>(list: &[T], least: usize, f: impl Fn(&[T]) + Sync) {
+struct Pool {
+    state: Mutex<PoolState>,
+    wake_workers: Condvar,
+    wake_caller: Condvar,
+    workers: usize,
+}
+
+#[derive(Default)]
+struct PoolState {
+    seq: u64,
+    active: usize,
+    threads: usize,
+    run: Option<(unsafe fn(usize), usize)>,
+}
+
+/// Runs `f` on pieces of `list`, of `least` items or more, on persistent worker threads.
+pub(crate) fn in_parallel<T: Sync, F: Fn(&[T]) + Sync>(list: &[T], least: usize, f: F) {
     const THREADS: usize = 6;
     if list.len() <= least {
         return f(list);
     }
     // Small pieces, taken in turn: they are not equally long to do.
     let piece = (list.len() / (THREADS * 8)).max(least);
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let work = || {
+    let threads = THREADS.min(list.len().div_ceil(piece));
+    if threads <= 1 {
+        return f(list);
+    }
+    static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if BUSY.swap(true, Ordering::Acquire) {
+        return f(list);
+    }
+    struct Clear(&'static std::sync::atomic::AtomicBool);
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let _busy = Clear(&BUSY);
+
+    static POOL: OnceLock<Arc<Pool>> = OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        let pool = Arc::new(Pool {
+            state: Mutex::default(),
+            wake_workers: Condvar::new(),
+            wake_caller: Condvar::new(),
+            workers: THREADS - 1,
+        });
+        let mut spawned = 0usize;
+        for id in 0..(THREADS - 1) {
+            let p = pool.clone();
+            let res = std::thread::Builder::new()
+                .name(format!("victory-parallel-{id}"))
+                .spawn(move || {
+                    let mut seen = 0u64;
+                    let mut s = p.state.lock().unwrap_or_else(|e| e.into_inner());
+                    loop {
+                        while s.seq == seen {
+                            s = p.wake_workers.wait(s).unwrap_or_else(|e| e.into_inner());
+                        }
+                        seen = s.seq;
+                        if id >= s.threads.saturating_sub(1) {
+                            continue;
+                        }
+                        let task = s.run;
+                        drop(s);
+                        if let Some((run, ctx)) = task {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                // SAFETY: caller keeps `ctx` alive until `active == 0`.
+                                unsafe { run(ctx) };
+                            }));
+                        }
+                        s = p.state.lock().unwrap_or_else(|e| e.into_inner());
+                        s.active -= 1;
+                        if s.active == 0 {
+                            p.wake_caller.notify_one();
+                        }
+                    }
+                });
+            if res.is_ok() {
+                spawned += 1;
+            }
+        }
+        // Only expose workers that actually spawned; if fewer spawned, threads < THREADS
+        // still leaves them idle only when id >= s.threads - 1, which is true for spawned.
+        let _ = spawned;
+        pool
+    });
+
+    let workers = (threads - 1).min(pool.workers);
+    if workers == 0 {
+        return f(list);
+    }
+
+    struct Job<'a, T, F> {
+        list: &'a [T],
+        piece: usize,
+        f: &'a F,
+        next: std::sync::atomic::AtomicUsize,
+    }
+    unsafe fn run_job<T: Sync, F: Fn(&[T]) + Sync>(ctx: usize) {
+        // SAFETY: `ctx` points to a live `Job` on the caller's stack while `active > 0`.
+        let job = unsafe { &*(ctx as *const Job<'_, T, F>) };
         loop {
-            let from = next.fetch_add(piece, Ordering::Relaxed);
-            if from >= list.len() {
+            let from = job.next.fetch_add(job.piece, Ordering::Relaxed);
+            if from >= job.list.len() {
                 break;
             }
-            f(&list[from..(from + piece).min(list.len())]);
+            (job.f)(&job.list[from..(from + job.piece).min(job.list.len())]);
         }
+    }
+    struct WaitPool<'a>(&'a Pool);
+    impl Drop for WaitPool<'_> {
+        fn drop(&mut self) {
+            let mut s = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+            while s.active > 0 {
+                s = self.0.wake_caller.wait(s).unwrap_or_else(|e| e.into_inner());
+            }
+            s.run = None;
+        }
+    }
+
+    let job = Job {
+        list,
+        piece,
+        f: &f,
+        next: std::sync::atomic::AtomicUsize::new(0),
     };
-    let threads = THREADS.min(list.len().div_ceil(piece));
-    std::thread::scope(|s| {
-        for _ in 1..threads {
-            s.spawn(work);
-        }
-        work();
-    });
+    let _wait = WaitPool(pool);
+    {
+        let mut s = pool.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.seq += 1;
+        s.active = workers;
+        s.threads = workers + 1;
+        s.run = Some((run_job::<T, F>, (&raw const job) as usize));
+        pool.wake_workers.notify_all();
+    }
+    // SAFETY: `job` outlives `_wait`.
+    unsafe { run_job::<T, F>((&raw const job) as usize) };
 }
 
 /// Brings `[from, from + len)` of a host copy up to date now.
@@ -3231,8 +3370,8 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         return;
     }
     if title_dst {
-        // The kernel writes the destination: it must not be guarded.
-        crate::watch::writing(dst as usize, len);
+        // Synchronous write into title memory: open without a 2-second pin.
+        crate::watch::open_for_write(dst as usize, len);
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
@@ -4619,6 +4758,17 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
         // SAFETY: our reservation.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn in_parallel_processes_all_items() {
+        let data: Vec<u32> = (1..=200).collect();
+        let sum = std::sync::atomic::AtomicU32::new(0);
+        super::in_parallel(&data, 8, |chunk| {
+            let s: u32 = chunk.iter().sum();
+            sum.fetch_add(s, std::sync::atomic::Ordering::Relaxed);
+        });
+        assert_eq!(sum.into_inner(), 200 * 201 / 2);
     }
 }
 

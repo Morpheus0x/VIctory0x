@@ -7,6 +7,7 @@
 //! `ResourceDescriptorHeap[]` draw or dispatch materializes and refreshes
 //! deferred buffer, constant-buffer, and placed-texture slots.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -430,37 +431,44 @@ impl BindlessPlan {
 fn copy_bounces(list: &[(usize, u64, u32)]) {
     const GAP: u64 = 4 << 10;
     const RUN: u64 = 128 << 10;
-    let mut scratch = vec![0u8; RUN as usize];
-    let mut rest = list;
-    while let Some(&(_, first, len)) = rest.first() {
-        let mut end = first + u64::from(len);
-        let mut n = 1;
-        for &(_, a, l) in &rest[1..] {
-            let to = end.max(a + u64::from(l));
-            if a < first || a > end + GAP || to - first > RUN {
-                break;
-            }
-            end = to;
-            n += 1;
-        }
-        let (run, after) = rest.split_at(n);
-        rest = after;
-        let whole = (end - first) as usize;
-        let read = n > 1
-            && whole <= scratch.len()
-            && crate::host::read_into(first as *const u8, &mut scratch[..whole]);
-        for &(cpu, a, l) in run {
-            if read {
-                let from = &scratch[(a - first) as usize..][..l as usize];
-                // SAFETY: a bounce slice of at least `l` bytes, ours.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(from.as_ptr(), cpu as *mut u8, l as usize);
-                }
-            } else {
-                crate::host::copy_mapped(cpu as *mut u8, a as *const u8, l as usize, false);
-            }
-        }
+    thread_local! {
+        static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     }
+    SCRATCH.with_borrow_mut(|scratch| {
+        if scratch.len() < RUN as usize {
+            scratch.resize(RUN as usize, 0);
+        }
+        let mut rest = list;
+        while let Some(&(_, first, len)) = rest.first() {
+            let mut end = first + u64::from(len);
+            let mut n = 1;
+            for &(_, a, l) in &rest[1..] {
+                let to = end.max(a + u64::from(l));
+                if a < first || a > end + GAP || to - first > RUN {
+                    break;
+                }
+                end = to;
+                n += 1;
+            }
+            let (run, after) = rest.split_at(n);
+            rest = after;
+            let whole = (end - first) as usize;
+            let read = n > 1
+                && whole <= scratch.len()
+                && crate::host::read_into(first as *const u8, &mut scratch[..whole]);
+            for &(cpu, a, l) in run {
+                if read {
+                    let from = &scratch[(a - first) as usize..][..l as usize];
+                    // SAFETY: a bounce slice of at least `l` bytes, ours.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(from.as_ptr(), cpu as *mut u8, l as usize);
+                    }
+                } else {
+                    crate::host::copy_mapped(cpu as *mut u8, a as *const u8, l as usize, false);
+                }
+            }
+        }
+    });
 }
 
 /// `ranges` (host copy, address, bytes) sorted and merged per host copy
@@ -1113,12 +1121,15 @@ impl HostHeap {
             kept.get_mut(index as usize)
                 .and_then(|slot| std::mem::replace(slot, resource))
         };
-        let old_tex = {
+        // `kept_textures` only ever holds an entry when `kept[index]` is `Some`.
+        let old_tex = if texture.is_some() || old.is_some() {
             let mut texs = self.kept_textures.lock().unwrap_or_else(|e| e.into_inner());
             match texture {
                 Some(t) => texs.insert(index, t),
                 None => texs.remove(&index),
             }
+        } else {
+            None
         };
         if let Some(old) = old {
             crate::host::retire(old);

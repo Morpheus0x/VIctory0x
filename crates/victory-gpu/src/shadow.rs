@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -246,7 +246,6 @@ impl Shadow {
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         if self.direct.is_some() {
-
             return;
         }
         let len = len.min(self.start + self.len - address);
@@ -345,7 +344,7 @@ impl Shadow {
                 if let Some((dirty_start, dirty_end)) = dirty_span {
                     let dirty_len = dirty_end - dirty_start;
                     if mode != 1 {
-                        crate::watch::writing(title_addr + dirty_start, dirty_len);
+                        crate::watch::open_for_write(title_addr + dirty_start, dirty_len);
                     }
                     crate::host::write_mapped(
                         (title_addr + dirty_start) as *mut u8,
@@ -600,7 +599,7 @@ impl Shadow {
                         {
                             let dirty_len = dirty_end - dirty_start;
                             if mode != 1 {
-                                crate::watch::writing(start + at + dirty_start, dirty_len);
+                                crate::watch::open_for_write(start + at + dirty_start, dirty_len);
                             }
                             crate::host::write_mapped(
                                 (start + at + dirty_start) as *mut u8,
@@ -716,11 +715,12 @@ impl Shadow {
             mode = NOT_WATCHED;
         }
         let lazy = lazy && !forced && always != 2;
-        if mode == WATCHED_GUARDED {
+        let mut was_guarded = false;
+        if always != 1 && always != 3 {
             let ge = crate::watch::region_epoch(from, to);
-            {
-                let spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
-                if spans.get(&(from, to)) == Some(&ge) {
+            let mut spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(&cached) = spans.get(&(from, to)) {
+                if cached == ge {
                     #[cfg(feature = "diagnostics")]
                     {
                         use crate::copystat::{C, add};
@@ -729,41 +729,13 @@ impl Shadow {
                     }
                     return 0;
                 }
+                spans.remove(&(from, to));
+                was_guarded = true;
             }
-            if let Some((now, written)) = crate::watch::writes_guarded(from, to) {
-                let copied = self.copy_stale(from, to, now, &written);
-                if crate::watch::region_epoch(from, to) == ge {
-                    let mut spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
-                    if spans.len() >= 8192 {
-                        spans.clear();
-                    }
-                    spans.insert((from, to), ge);
-                }
-                #[cfg(feature = "diagnostics")]
-                {
-                    use crate::copystat::{C, add};
-                    add(C::Checked, (to - from) as u64);
-                    add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
-                }
-                return copied;
-            }
-        } else if mode != NOT_WATCHED {
-            // Probe write-watch first; if that fails and guard succeeds, mark
-            // this shadow as guarded so subsequent calls skip GetWriteWatch.
-            if let Some((now, written)) = crate::watch::writes(from, to, false) {
-                self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
-                #[cfg(feature = "diagnostics")]
-                {
-                    use crate::copystat::{C, add};
-                    add(C::Checked, (to - from) as u64);
-                    add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
-                }
-                return copied;
-            }
+        }
+        if mode == WATCHED_GUARDED || was_guarded {
             let ge = crate::watch::region_epoch(from, to);
             if let Some((now, written)) = crate::watch::writes_guarded(from, to) {
-                self.watched.store(WATCHED_GUARDED, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
                 if crate::watch::region_epoch(from, to) == ge {
                     let mut spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
@@ -779,6 +751,48 @@ impl Shadow {
                     add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
                 }
                 return copied;
+            }
+        }
+        if mode != WATCHED_GUARDED && mode != NOT_WATCHED {
+            // Probe write-watch first; if that fails and guard succeeds, mark
+            // non-sparse shadows as guarded so subsequent calls skip GetWriteWatch.
+            // Sparse 2 GiB shadows hold both private and mapped allocations, so
+            // they must never lock the whole chunk to one watch mode.
+            if let Some((now, written)) = crate::watch::writes(from, to, false) {
+                if self.sparse.is_none() {
+                    self.watched.store(1, Ordering::Relaxed);
+                }
+                let copied = self.copy_stale(from, to, now, &written);
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::Checked, (to - from) as u64);
+                    add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+                }
+                return copied;
+            }
+            if always != 3 {
+                let ge = crate::watch::region_epoch(from, to);
+                if let Some((now, written)) = crate::watch::writes_guarded(from, to) {
+                    if self.sparse.is_none() {
+                        self.watched.store(WATCHED_GUARDED, Ordering::Relaxed);
+                    }
+                    let copied = self.copy_stale(from, to, now, &written);
+                    if crate::watch::region_epoch(from, to) == ge {
+                        let mut spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
+                        if spans.len() >= 8192 {
+                            spans.clear();
+                        }
+                        spans.insert((from, to), ge);
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        use crate::copystat::{C, add};
+                        add(C::Checked, (to - from) as u64);
+                        add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+                    }
+                    return copied;
+                }
             }
             // A sparse shadow spans a 2 GiB chunk that may contain both
             // watchable mapped/private regions and unmapped holes: one
@@ -965,11 +979,7 @@ impl Shadow {
 
 /// Windows of title memory the host GPU reads and writes in place, by start:
 /// each a run of committed pages of one allocation.
-static DIRECT: Mutex<BTreeMap<u64, Arc<Shadow>>> = Mutex::new(BTreeMap::new());
-
-fn windows_of_memory() -> std::sync::MutexGuard<'static, BTreeMap<u64, Arc<Shadow>>> {
-    DIRECT.lock().unwrap_or_else(|e| e.into_inner())
-}
+static DIRECT: RwLock<BTreeMap<u64, Arc<Shadow>>> = RwLock::new(BTreeMap::new());
 
 /// Buffers of windows gone since (by interface address): views of them are
 /// made again.
@@ -1095,7 +1105,9 @@ fn run_of(from: u64, to: u64) -> Option<(u64, u64)> {
 
 /// Whether `[address, end)` lies in a window made already.
 pub(crate) fn in_place(address: u64, end: u64) -> bool {
-    windows_of_memory()
+    DIRECT
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
         .range(..=address)
         .rev()
         .take(8)
@@ -1124,8 +1136,9 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
         device
     });
     let device = device.as_ref()?;
-    let mut map = windows_of_memory();
-    if let Some(s) = map
+    if let Some(s) = DIRECT
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
         .range(..=address)
         .rev()
         .take(8)
@@ -1137,17 +1150,19 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
     // Asked over and over for the same memory: not looked at each time.
     static REFUSED: Mutex<BTreeMap<u64, (u64, u64)>> = Mutex::new(BTreeMap::new());
     let frame = crate::queue::presented();
-    let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&(e, f)) = refused.get(&address)
-        && e == end
-        && f + 30 > frame
     {
-        return None;
+        let refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&(e, f)) = refused.get(&address)
+            && e == end
+            && f + 30 > frame
+        {
+            return None;
+        }
     }
     let page = PAGE as u64;
     let window = run_of(address & !(page - 1), end.next_multiple_of(page)).and_then(|(start, stop)| {
         // Read-only guards would refuse the GPU's writes.
-        crate::watch::writing(start as usize, (stop - start) as usize);
+        crate::watch::open_for_write(start as usize, (stop - start) as usize);
         // SAFETY: committed memory; the heap keeps its pages.
         let heap: Result<ID3D12Heap, _> = unsafe {
             device.OpenExistingHeapFromAddress1(start as *const _, (stop - start) as usize)
@@ -1189,9 +1204,22 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
                 tracing::info!("its regions:{text}");
             }
         }
-        refused.insert(address, (end, frame));
+        REFUSED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(address, (end, frame));
         return None;
     };
+    let mut map = DIRECT.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = map
+        .range(..=address)
+        .rev()
+        .take(8)
+        .map(|(_, s)| s)
+        .find(|s| s.start + s.len >= end)
+    {
+        return Some(s.clone());
+    }
     let count = map.len() + 1;
     if count <= 16 || count.is_power_of_two() {
         tracing::info!(
@@ -1313,7 +1341,7 @@ fn unmapped(address: usize) -> Option<usize> {
 /// Tiles of `[start, end)` known to have no title memory are looked at again.
 pub(crate) fn filled(start: u64, end: u64) {
     let over: Vec<Arc<Shadow>> = SPARSE
-        .lock()
+        .read()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
         .filter(|(chunk, _)| *chunk * CHUNK < end && start < (*chunk + 1) * CHUNK)
@@ -1350,7 +1378,7 @@ pub(crate) fn remapped(start: u64, end: u64) {
     use windows::core::Interface;
     filled(start, end);
     crate::memory::remapped(start, end);
-    let mut map = windows_of_memory();
+    let mut map = DIRECT.write().unwrap_or_else(|e| e.into_inner());
     if map.is_empty() {
         return;
     }
@@ -1521,6 +1549,8 @@ struct Sparse {
     tiles: Mutex<std::collections::HashMap<u32, Tile, Mix>>,
     /// What tiles shaders write held before the submission.
     before: Mutex<std::collections::HashMap<u32, Vec<u8>, Mix>>,
+    /// Tiles already verified clean or synced in this submission's copy-back.
+    unchanged: Mutex<std::collections::HashSet<u32, Mix>>,
     /// By tile: the frame to look at it next in, and how often in a row it
     /// had not changed.
     looks: Mutex<std::collections::HashMap<u32, Arc<Mutex<Look>>, Mix>>,
@@ -1661,7 +1691,7 @@ pub(crate) fn sweep(frame: u64) {
     let mut given = 0u64;
     let started = std::time::Instant::now();
     let all: Vec<Arc<Shadow>> = SPARSE
-        .lock()
+        .read()
         .unwrap_or_else(|e| e.into_inner())
         .values()
         .flatten()
@@ -1821,7 +1851,7 @@ fn buffer_desc(
 }
 
 /// Sparse copies by chunk.
-static SPARSE: Mutex<BTreeMap<u64, Option<Arc<Shadow>>>> = Mutex::new(BTreeMap::new());
+static SPARSE: RwLock<BTreeMap<u64, Option<Arc<Shadow>>>> = RwLock::new(BTreeMap::new());
 
 fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow> {
     use windows::Win32::Graphics::Direct3D12::*;
@@ -1866,6 +1896,7 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
         sparse: Some(Sparse {
             tiles: Mutex::default(),
             before: Mutex::default(),
+            unchanged: Mutex::default(),
             looks: Mutex::default(),
             kept: Mutex::default(),
             aliases: Mutex::default(),
@@ -1880,11 +1911,15 @@ fn sparse(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if cfg!(test) || (end - 1) / CHUNK != address / CHUNK {
         return None;
     }
+    let key = address / CHUNK;
+    if let Some(entry) = SPARSE.read().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return entry.clone();
+    }
     SPARSE
-        .lock()
+        .write()
         .unwrap_or_else(|e| e.into_inner())
-        .entry(address / CHUNK)
-        .or_insert_with(|| sparse_buffer(address / CHUNK * CHUNK, CHUNK, None).map(Arc::new))
+        .entry(key)
+        .or_insert_with(|| sparse_buffer(key * CHUNK, CHUNK, None).map(Arc::new))
         .clone()
 }
 
@@ -2115,58 +2150,93 @@ impl Shadow {
         let views = self.tiles_of(s, address, address + len);
         let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
         let start = self.start as usize;
-        // (title address, view, length, the snapshot's bytes): one tile each,
-        // so no two touch the same memory.
-        let work: Vec<(usize, usize, usize, usize)> = views
-            .iter()
-            .filter_map(|&(at, data, n)| {
-                let old = before.get_mut(&(((at - start) / PAGE) as u32))?;
-                Some((at, data, n, old.as_mut_ptr() as usize + at % PAGE))
-            })
-            .collect();
+        let work: Vec<(usize, usize, usize, usize)> = {
+            let unchanged = s.unchanged.lock().unwrap_or_else(|e| e.into_inner());
+            views
+                .iter()
+                .filter_map(|&(at, data, n)| {
+                    let tile = ((at - start) / PAGE) as u32;
+                    if at.is_multiple_of(PAGE) && n == PAGE && unchanged.contains(&tile) {
+                        return None;
+                    }
+                    let old = before.get_mut(&tile)?;
+                    Some((at, data, n, old.as_mut_ptr() as usize + at % PAGE))
+                })
+                .collect()
+        };
         let written = std::sync::atomic::AtomicUsize::new(0);
-        crate::host::in_parallel(&work, 8, |chunk| {
-            let mut title: Option<Vec<u8>> = None;
-            for &(at, data, n, old) in chunk {
-                // SAFETY: the tile's mapping and its snapshot (kept under the
-                // lock held above); this tile is this thread's alone.
-                let host = unsafe { std::slice::from_raw_parts_mut(data as *mut u8, n) };
-                let old = unsafe { std::slice::from_raw_parts_mut(old as *mut u8, n) };
-                #[cfg(feature = "diagnostics")]
-                SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
-                if host == old {
-                    continue;
+        let clean = Mutex::new(Vec::new());
+        if !work.is_empty() {
+            crate::host::in_parallel(&work, 8, |chunk| {
+                let mut title: Option<Vec<u8>> = None;
+                let mut local_clean = Vec::new();
+                for &(at, data, n, old) in chunk {
+                    let whole = at.is_multiple_of(PAGE) && n == PAGE;
+                    // SAFETY: the tile's mapping and its snapshot (kept under the
+                    // lock held above); this tile is this thread's alone.
+                    let host = unsafe { std::slice::from_raw_parts_mut(data as *mut u8, n) };
+                    let old = unsafe { std::slice::from_raw_parts_mut(old as *mut u8, n) };
+                    #[cfg(feature = "diagnostics")]
+                    SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
+                    if host == old {
+                        if whole {
+                            local_clean.push(((at - start) / PAGE) as u32);
+                        }
+                        continue;
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
+                    let buf = title.get_or_insert_with(|| {
+                        let mut v = pooled(PAGE);
+                        v.resize(PAGE, 0);
+                        v
+                    });
+                    if !crate::host::read_into(at as *const u8, &mut buf[..n]) {
+                        continue;
+                    }
+                    if let Some((dirty_start, dirty_end)) =
+                        merge_gpu_writes_mut(&mut buf[..n], host, old)
+                    {
+                        let dirty_len = dirty_end - dirty_start;
+                        crate::watch::open_for_write(at + dirty_start, dirty_len);
+                        crate::host::write_mapped(
+                            (at + dirty_start) as *mut u8,
+                            buf[dirty_start..].as_ptr(),
+                            dirty_len,
+                        );
+                        written.fetch_add(dirty_len, Ordering::Relaxed);
+                    }
+                    if whole {
+                        local_clean.push(((at - start) / PAGE) as u32);
+                    }
                 }
-                #[cfg(feature = "diagnostics")]
-                SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
-                let buf = title.get_or_insert_with(|| {
-                    let mut v = pooled(PAGE);
-                    v.resize(PAGE, 0);
-                    v
-                });
-                if !crate::host::read_into(at as *const u8, &mut buf[..n]) {
-                    continue;
+                if !local_clean.is_empty() {
+                    clean
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend(local_clean);
                 }
-                if let Some((dirty_start, dirty_end)) = merge_gpu_writes_mut(&mut buf[..n], host, old) {
-                    let dirty_len = dirty_end - dirty_start;
-                    crate::watch::writing(at + dirty_start, dirty_len);
-                    crate::host::write_mapped(
-                        (at + dirty_start) as *mut u8,
-                        buf[dirty_start..].as_ptr(),
-                        dirty_len,
-                    );
-                    written.fetch_add(dirty_len, Ordering::Relaxed);
+                if let Some(buf) = title {
+                    give_back(buf);
                 }
+            });
+            let clean = clean.into_inner().unwrap_or_else(|e| e.into_inner());
+            if !clean.is_empty() {
+                s.unchanged
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend(clean);
             }
-            if let Some(buf) = title {
-                give_back(buf);
-            }
-        });
+        }
         let written = written.into_inner();
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
         if pending.is_empty() {
             give_back_tiles(before.drain().map(|(_, buf)| buf));
+            s.unchanged
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
         }
         written
     }
@@ -2238,7 +2308,7 @@ fn merge_gpu_writes_mut(
                 }
                 let t = title[k];
                 host[k] = t;
-                old[k] = t;
+                old[i + (k - i)] = t;
             }
         }
         i += 8;
@@ -2547,14 +2617,20 @@ pub(crate) fn near(va: u64) -> String {
             .values()
             .map(|s| (s.gpu, s.start, s.len)),
     );
-    for s in SPARSE.lock().unwrap_or_else(|e| e.into_inner()).values().flatten() {
+    for s in SPARSE.read().unwrap_or_else(|e| e.into_inner()).values().flatten() {
         all.push((s.gpu, s.start, s.len));
         if let Some(sparse) = &s.sparse {
             let aliases = sparse.aliases.lock().unwrap_or_else(|e| e.into_inner());
             all.extend(aliases.iter().map(|a| (a.gpu, a.start, a.len)));
         }
     }
-    all.extend(windows_of_memory().values().map(|s| (s.gpu, s.start, s.len)));
+    all.extend(
+        DIRECT
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|s| (s.gpu, s.start, s.len)),
+    );
     let below = all.iter().filter(|c| c.0 <= va).max();
     let above = all.iter().filter(|c| c.0 > va).min();
     let mut text = match below {
