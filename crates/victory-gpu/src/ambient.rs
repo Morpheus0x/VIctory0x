@@ -146,9 +146,9 @@ pub(crate) fn sky_drawn(image: usize) {
 /// right were 0.07 at night, 0.3 at dusk and 1.4 at noon (runs lum1, pr1,
 /// av1, 2026-11-25), with sky means of 0.001 at night and 0.65 at dawn; one
 /// level for all hours either drowned the title's own shadows or left what
-/// the sun does not reach black. `VICTORY_AMBIENT_SKY=gain,least` turns it
-/// on (unfinished: see [`follow`]); a file of two numbers, or six with the
-/// shading's, does so in a running game.
+/// the sun does not reach black. On by default; `VICTORY_AMBIENT_SKY=off`
+/// keeps the constant, `gain,least,power` sets it; a file of two or three
+/// numbers, or six or seven with the shading's, does so in a running game.
 /// shortcut: the sky's mean stands in for the light the title's traced
 /// probes would gather; indoors it is the sky's too.
 static FOLLOW: std::sync::Mutex<Option<Option<[f32; 3]>>> = std::sync::Mutex::new(None);
@@ -163,13 +163,9 @@ fn follow() -> Option<[f32; 3]> {
     }
     static SET: OnceLock<Option<[f32; 3]>> = OnceLock::new();
     *SET.get_or_init(|| {
-        // Off unless asked for: it does not work yet. The image the sky
-        // program draws into is not the one expected here, and the sky is in
-        // the scene's units while the light is exposed already, so the
-        // title's exposure is needed too.
-        let Ok(set) = std::env::var("VICTORY_AMBIENT_SKY") else {
-            return None;
-        };
+        // On unless `off`: by day and by night it looked right where a
+        // constant did not (runs ciel3, opt1b, 2026-11-25).
+        let set = std::env::var("VICTORY_AMBIENT_SKY").unwrap_or_default();
         if set.trim() == "off" {
             return None;
         }

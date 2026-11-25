@@ -43,9 +43,9 @@ Picture:
   reaches creases, corners and the underside of things, worked out from the
   scene's depth alone (`VICTORY_AMBIENT_SHADE=strength,radius`; grainy, it is
   not blurred yet). In diagnostics builds all of it can be tuned in a running
-  game from a file (`VICTORY_AMBIENT_FILE`). It can follow the sky dome the
-  game draws for its reflections (`VICTORY_AMBIENT_SKY=gain,least,power`, or
-  a file of three or seven numbers): its level is `gain * mean^power +
+  game from a file (`VICTORY_AMBIENT_FILE`). It follows the sky dome the
+  game draws for its reflections (`VICTORY_AMBIENT_SKY=off` keeps the
+  constant, `gain,least,power` sets it): its level is `gain * mean^power +
   least` with the sky's hue, so night, dawn and noon need no hand-set level.
 - Translated shaders get clean-up passes before they are written (dead
   code, constants, one instruction for one value, branch facts, one read
@@ -157,8 +157,8 @@ The first launch after a build translates every shader and builds about
   drive (the title's own 7 GB, 8 GB of textures on the card, copies of its
   buffers, and the system's backing of video memory).
 - No ray-traced light; what stands in for it is the same everywhere in a
-  frame. Without the sky following (off unless asked for, see above) the
-  default constant of 0.6 is too much at night and too little at noon.
+  frame. With the sky following turned off the constant of 0.6 is too much at
+  night and too little at noon.
 - Streamed textures are capped at 1024 pixels a side (512, then 256, as
   video memory fills): at 2048 this 16 GB card goes 1 to 2 GB over its
   budget (`VICTORY_TEXTURE_MAX=2048` to try).
