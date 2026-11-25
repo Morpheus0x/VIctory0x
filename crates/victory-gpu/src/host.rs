@@ -3921,6 +3921,12 @@ impl Meter {
                     "textures changed in place"
                 );
                 crate::texture::flips::log();
+                {
+                    static CENSUS: AtomicU32 = AtomicU32::new(0);
+                    if CENSUS.fetch_add(1, Ordering::Relaxed) % 6 == 5 {
+                        crate::resource::placed_census();
+                    }
+                }
                 crate::copystat::log(frames);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(

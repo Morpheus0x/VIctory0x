@@ -279,6 +279,18 @@ fn dump(shader: &Shader) {
     }
 }
 
+/// As [`dump`], for the shaders of a pipeline the host refused: they
+/// translate, so only this tells which containers to look at.
+#[cfg(windows)]
+fn dump_all(shaders: &[Arc<Shader>]) {
+    #[cfg(feature = "diagnostics")]
+    for shader in shaders {
+        dump(shader);
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = shaders;
+}
+
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage, RootType};
