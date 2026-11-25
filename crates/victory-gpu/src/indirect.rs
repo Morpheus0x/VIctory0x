@@ -412,7 +412,7 @@ pub(crate) fn bound_before(
     if !src_gpu.is_multiple_of(4) || !count_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
         return None;
     }
-    let (dst, at) = clamps.clamp_room(bytes)?;
+    let (dst, at, bind) = clamps.clamp_room(bytes)?;
     // SAFETY: a live buffer.
     let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
     let constants = [kind, stride, records, args_offset, has_count, count_offset];
@@ -423,7 +423,7 @@ pub(crate) fn bound_before(
     // Only clamps record compute state in `clamps`, and they all bind the
     // same signature, pipeline and budget.
     unsafe {
-        if clamps.clamp_unbound() {
+        if bind {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
             l.SetComputeRootUnorderedAccessView(4, budget);

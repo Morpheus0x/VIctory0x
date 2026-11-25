@@ -154,8 +154,15 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
+    let mut prev = usize::MAX;
+    for &at in &j.found[..count] {
+        let page = at / PAGE;
+        if page != prev {
+            j.written.insert(page, now);
+            prev = page;
+        }
+    }
+    for page in guarded {
         j.written.insert(page, now);
     }
     Some((
@@ -702,6 +709,40 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     true
 }
 
+fn open_aliases(g: &mut Guards, first: usize, last: usize, until: Option<std::time::Instant>) {
+    if !view_guard() {
+        return;
+    }
+    // The same pages at their other views: the write lands in them too, so
+    // their copies must take them again.
+    for block in first..last {
+        let shown = aliases(block * BLOCK);
+        if shown.len() < 2 || shown.len() > MANY_VIEWS {
+            continue;
+        }
+        for alias in shown {
+            if alias / BLOCK != block {
+                if let Some(until) = until {
+                    g.pins.push((alias / BLOCK, alias / BLOCK + 1, until));
+                }
+                open_here(g, alias, alias + BLOCK);
+            }
+        }
+    }
+}
+
+/// Opens guarded blocks of `[at, at + len)` (and their other views) for an
+/// immediate CPU write, without pinning them writable across submissions.
+pub(crate) fn open_for_write(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let (first, last) = (at / BLOCK, (at + len).div_ceil(BLOCK));
+    let mut g = guards();
+    open(&mut g, at, at + len);
+    open_aliases(&mut g, first, last, None);
+}
+
 /// Before our own write into title memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler): opens its guarded blocks.
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
@@ -712,26 +753,14 @@ pub fn writing(at: usize, len: usize) {
     }
     let (first, last) = (at / BLOCK, (at + len).div_ceil(BLOCK));
     let mut g = guards();
-    let until = std::time::Instant::now() + PIN;
+    let now = std::time::Instant::now();
+    if !g.pins.is_empty() {
+        g.pins.retain(|&(_, _, until)| until > now);
+    }
+    let until = now + PIN;
     g.pins.push((first, last, until));
     open(&mut g, at, at + len);
-    if !view_guard() {
-        return;
-    }
-    // The same pages at their other views: the write lands in them too, so
-    // their copies must take them again, now and when it has landed.
-    for block in first..last {
-        let shown = aliases(block * BLOCK);
-        if shown.len() < 2 || shown.len() > MANY_VIEWS {
-            continue;
-        }
-        for alias in shown {
-            if alias / BLOCK != block {
-                g.pins.push((alias / BLOCK, alias / BLOCK + 1, until));
-                open_here(&mut g, alias, alias + BLOCK);
-            }
-        }
-    }
+    open_aliases(&mut g, first, last, Some(until));
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
