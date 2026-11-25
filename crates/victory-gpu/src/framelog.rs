@@ -64,6 +64,11 @@ pub fn add(t: T, n: u64) {
     TOTAL[t as usize].fetch_add(n, Relaxed);
 }
 
+#[cfg(test)]
+pub(crate) fn total(t: T) -> u64 {
+    TOTAL[t as usize].load(Relaxed)
+}
+
 /// Thread-local counters accumulated on the presenting thread between presents.
 #[derive(Clone, Copy)]
 #[repr(usize)]
@@ -90,48 +95,33 @@ pub fn here(h: H, n: u64) {
     });
 }
 
+fn slow_mask(sets: &[(u32, u8, u8)]) -> Vec<bool> {
+    let best = sets.iter().map(|c| c.2).max().unwrap_or(0);
+    let mut slow = vec![false; sets.iter().map(|c| c.1 as usize + 1).max().unwrap_or(0)];
+    for (_, processor, class) in sets {
+        slow[*processor as usize] = *class < best;
+    }
+    slow
+}
+
 /// Returns whether the calling thread currently runs on a lower-efficiency logical core
 /// (always `false` on symmetric CPUs).
 pub fn on_slow_core() -> bool {
     use windows_sys::Win32::System::Threading::GetCurrentProcessorNumber;
     static SLOW: std::sync::OnceLock<Vec<bool>> = std::sync::OnceLock::new();
-    let slow = SLOW.get_or_init(|| {
-        let sets = cpu_sets();
-        let best = sets.iter().map(|c| c.2).max().unwrap_or(0);
-        let mut slow = vec![false; sets.iter().map(|c| c.1 as usize + 1).max().unwrap_or(0)];
-        for (_, processor, class) in &sets {
-            slow[*processor as usize] = *class < best;
-        }
-        slow
-    });
+    let slow = SLOW.get_or_init(|| slow_mask(&cpu_sets()));
     // SAFETY: plain processor-index query with no side effects.
     let processor = unsafe { GetCurrentProcessorNumber() } as usize;
     slow.get(processor).copied().unwrap_or(false)
 }
 
-fn cpu_sets() -> Vec<(u32, u8, u8)> {
-    use windows_sys::Win32::System::SystemInformation::{
-        GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION,
-    };
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let mut bytes = 0u32;
-    // SAFETY: size query on our current process.
-    unsafe { GetSystemCpuSetInformation(std::ptr::null_mut(), 0, &mut bytes, GetCurrentProcess(), 0) };
-    let mut buffer = vec![0u64; (bytes as usize).div_ceil(8).max(1)];
-    // SAFETY: `buffer` holds `bytes` aligned bytes.
-    let ok = unsafe {
-        GetSystemCpuSetInformation(
-            buffer.as_mut_ptr().cast(),
-            bytes,
-            &mut bytes,
-            GetCurrentProcess(),
-            0,
-        )
-    };
+fn parse_cpu_sets(buffer: &[u64], bytes: usize) -> Vec<(u32, u8, u8)> {
+    use windows_sys::Win32::System::SystemInformation::SYSTEM_CPU_SET_INFORMATION;
     let mut sets = Vec::new();
     let mut at = 0usize;
-    while ok != 0 && at + size_of::<SYSTEM_CPU_SET_INFORMATION>() <= bytes as usize {
-        // SAFETY: record lies within `[0..bytes]` and reports its own `Size`.
+    let limit = bytes.min(size_of_val(buffer));
+    while at + size_of::<SYSTEM_CPU_SET_INFORMATION>() <= limit {
+        // SAFETY: record lies within `buffer` and reports its own `Size`.
         let info = unsafe {
             &*(buffer
                 .as_ptr()
@@ -152,17 +142,50 @@ fn cpu_sets() -> Vec<(u32, u8, u8)> {
     sets
 }
 
+fn cpu_sets() -> Vec<(u32, u8, u8)> {
+    use windows_sys::Win32::System::SystemInformation::GetSystemCpuSetInformation;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut bytes = 0u32;
+    // SAFETY: size query on our current process.
+    unsafe { GetSystemCpuSetInformation(std::ptr::null_mut(), 0, &mut bytes, GetCurrentProcess(), 0) };
+    let mut buffer = vec![0u64; (bytes as usize).div_ceil(8).max(1)];
+    // SAFETY: `buffer` holds `bytes` aligned bytes.
+    let ok = unsafe {
+        GetSystemCpuSetInformation(
+            buffer.as_mut_ptr().cast(),
+            bytes,
+            &mut bytes,
+            GetCurrentProcess(),
+            0,
+        )
+    };
+    if ok == 0 {
+        return Vec::new();
+    }
+    parse_cpu_sets(&buffer, bytes as usize)
+}
+
+fn parse_on(value: Option<&std::ffi::OsStr>, diagnostics: bool) -> bool {
+    match value {
+        Some(v) => v != "0",
+        None => diagnostics,
+    }
+}
+
 /// Whether per-frame breakdown logging is active.
 pub fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var_os("VICTORY_FRAME_LOG") {
-        Some(v) => v != "0",
-        None => cfg!(feature = "diagnostics"),
+    *ON.get_or_init(|| {
+        parse_on(
+            std::env::var_os("VICTORY_FRAME_LOG").as_deref(),
+            cfg!(feature = "diagnostics"),
+        )
     })
 }
 
 fn micros(t: windows_sys::Win32::Foundation::FILETIME) -> u64 {
-    (u64::from(t.dwHighDateTime) << 32 | u64::from(t.dwLowDateTime)) / 10
+    // Disjoint 32-bit halves: `+` matches `|` and avoids equivalent `|` -> `^` mutants.
+    ((u64::from(t.dwHighDateTime) << 32) + u64::from(t.dwLowDateTime)) / 10
 }
 
 fn thread_times() -> (u64, u64) {
@@ -416,6 +439,10 @@ fn lines(frames: &[Frame], usual: f64, seconds: f64) -> Vec<String> {
 const RECENT: usize = 64;
 const LONG_MOST: usize = 8;
 
+fn ready_to_flush(elapsed: std::time::Duration, empty: bool) -> bool {
+    !empty && elapsed >= std::time::Duration::from_secs(5)
+}
+
 /// Records a finished frame at present time and emits a 5-second breakdown when enabled.
 pub fn frame() {
     if !on() {
@@ -458,7 +485,7 @@ pub fn frame() {
         state.frames.push(f);
     }
     let elapsed = state.since.elapsed();
-    if elapsed < std::time::Duration::from_secs(5) || state.frames.is_empty() {
+    if !ready_to_flush(elapsed, state.frames.is_empty()) {
         return;
     }
     let frames = std::mem::take(&mut state.frames);
@@ -534,6 +561,13 @@ mod tests {
 
     #[test]
     fn more_long_frames_than_are_listed_are_counted() {
+        let exact: Vec<Frame> = (0..LONG_MOST).map(|i| frame(i as u64, 500.0)).collect();
+        let exact_out = lines(&exact, 100_000.0, 5.0);
+        assert_eq!(
+            exact_out.iter().filter(|l| l.starts_with("long frame ")).count(),
+            LONG_MOST
+        );
+        assert!(!exact_out.iter().any(|l| l.starts_with("long frames:")));
         let mut frames: Vec<Frame> = (0..12).map(|i| frame(i, 500.0)).collect();
         frames.push(frame(12, 100.0));
         let out = lines(&frames, 100_000.0, 5.0);
@@ -551,9 +585,265 @@ mod tests {
     fn totals_and_a_threads_own_counts_add_up() {
         let before = TOTAL[T::DiskReads as usize].load(Relaxed);
         add(T::DiskReads, 3);
-        assert_eq!(TOTAL[T::DiskReads as usize].load(Relaxed) - before, 3);
+        assert_eq!(total(T::DiskReads) - before, 3);
         here(H::PaceUs, 5);
         here(H::PaceUs, 6);
         assert_eq!(HERE.with(|c| c.get())[H::PaceUs as usize], 11);
+    }
+
+    #[test]
+    fn frame_log_helpers_cover_switches_filetime_median_and_means() {
+        use std::ffi::OsStr;
+        assert!(!parse_on(None, false));
+        assert!(parse_on(None, true));
+        assert!(!parse_on(Some(OsStr::new("0")), true));
+        assert!(parse_on(Some(OsStr::new("1")), false));
+
+        assert_eq!(median(std::iter::empty()), 0.0);
+        assert_eq!(median([30.0, 10.0, 20.0].into_iter()), 20.0);
+        assert_eq!(median([10.0, 40.0, 20.0, 30.0].into_iter()), 30.0);
+        assert_eq!(long_over(0.0), 40_000.0);
+        assert_eq!(long_over(100_000.0), 150_000.0);
+        // Boundary: equal to `long_over(100_000.0) == 150_000.0` is not marked long (`>` strict).
+        let boundary = lines(&[frame(0, 150.0)], 100_000.0, 1.0);
+        assert!(boundary[0].contains("0 long"), "{}", boundary[0]);
+        assert!(boundary.iter().all(|l| !l.starts_with("long frame")));
+
+        let ft = windows_sys::Win32::Foundation::FILETIME {
+            dwLowDateTime: 1_000_000,
+            dwHighDateTime: 1,
+        };
+        assert_eq!(micros(ft), ((1u64 << 32) + 1_000_000) / 10);
+
+        let mut a = frame(1, 100.0);
+        a.s = [
+            20_000.0, 2_000.0, 50_000.0, 5_000.0, 12.0, 100.0, 20.0, 2.0, 4.0, 4096.0,
+        ];
+        a.h = [3_000.0, 4_000.0];
+        a.t[T::PresentShowUs as usize] = 2_000.0;
+        a.t[T::Submissions as usize] = 4.0;
+        a.t[T::PrepareUs as usize] = 6_000.0;
+        a.t[T::CardWaitUs as usize] = 8_000.0;
+        a.t[T::CopyUs as usize] = 1_000.0;
+        a.t[T::CopyBytes as usize] = 2_000_000.0;
+        a.t[T::CopyBackUs as usize] = 500.0;
+        a.t[T::CopyBackBytes as usize] = 100_000.0;
+        a.t[T::CardSyncUs as usize] = 4_000.0;
+        a.t[T::CardSyncLists as usize] = 2.0;
+        a.t[T::CardCheckUs as usize] = 2_000.0;
+        a.t[T::CardCheckLists as usize] = 1.0;
+        a.t[T::CardListsUs as usize] = 12_000.0;
+        a.t[T::CardLists as usize] = 6.0;
+        a.t[T::ExecuteUs as usize] = 9_000.0;
+        a.t[T::RefreshUs as usize] = 3_000.0;
+        a.t[T::Remaps as usize] = 2.0;
+        a.t[T::RemapUs as usize] = 1_000.0;
+        a.t[T::PipelineWaitUs as usize] = 5_000.0;
+        a.t[T::DiskReads as usize] = 10.0;
+        a.t[T::DiskBytes as usize] = 4_000_000.0;
+        a.t[T::DiskUs as usize] = 2_000.0;
+        a.t[T::GuardFaults as usize] = 6.0;
+        a.t[T::PaceUs as usize] = 8_000.0;
+        a.t[T::RenderLooks as usize] = 1.0;
+        let mut b = a.clone();
+        b.number = 2;
+        b.us = 200_000.0;
+        b.t[T::PresentUs as usize] = 20_000.0;
+        b.t[T::Uploads as usize] = 200.0;
+        b.t[T::CardSyncUs as usize] = 6_000.0;
+        b.t[T::CardSyncLists as usize] = 4.0;
+        let avg = mean(&[&a, &b]);
+        assert_eq!(avg.us, 150_000.0);
+        assert_eq!(avg.s[S_THREAD_USER], 20_000.0);
+        assert_eq!(avg.h[H::ExecuteUs as usize], 3_000.0);
+        assert_eq!(avg.t[T::CardSyncLists as usize], 3.0);
+        let summary = text(&avg);
+        for needle in [
+            "150 ms |",
+            "ran 22 ms (user 20, kernel 2)",
+            "present 15.0 ms (show 2.0)",
+            "execute 3.0 ms, paced 4.0 ms",
+            "submissions: 4, preparing 6.0 ms, card wait 8.0 ms",
+            "copies 1.0 ms 2.0 MB",
+            "copy-back 0.5 ms 0.10 MB",
+            "sync 5.0 ms in 3, check 2.0 ms in 1, lists 12.0 ms in 6",
+            "execute all 9.0 ms",
+            "refresh 3.0 ms, 150 uploads",
+            "remaps: 2 (1.0 ms)",
+            "pipelines: 2 made, 4 loaded, 5.0 ms waited",
+            "disk: 10 reads 4.0 MB 2.0 worker ms",
+            "faults: 12 page, 6 guard",
+            "process: 50 user 5 kernel ms",
+            "pacing all 8.0 ms",
+            "100 draws, 20 dispatches",
+            "4096 MB free",
+            "slow core render 0/1",
+        ] {
+            assert!(summary.contains(needle), "missing {needle:?} in {summary}");
+        }
+    }
+
+    #[test]
+    fn cpu_set_parsing_slow_mask_and_os_samplers_work() {
+        use std::time::{Duration, Instant};
+        use windows_sys::Win32::System::SystemInformation::{
+            SYSTEM_CPU_SET_INFORMATION, SYSTEM_CPU_SET_INFORMATION_0,
+            SYSTEM_CPU_SET_INFORMATION_0_0,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcessorNumber;
+
+        assert_eq!(slow_mask(&[]), Vec::<bool>::new());
+        assert_eq!(slow_mask(&[(1, 0, 0), (2, 1, 0)]), vec![false, false]);
+        assert_eq!(
+            slow_mask(&[(1, 0, 1), (2, 1, 0), (3, 2, 2)]),
+            vec![true, true, false]
+        );
+        let sets = cpu_sets();
+        assert!(!sets.is_empty());
+        assert!(sets.iter().all(|c| c.0 >= 256));
+        // SAFETY: plain processor-index query.
+        let proc_idx = unsafe { GetCurrentProcessorNumber() } as usize;
+        assert_eq!(
+            on_slow_core(),
+            slow_mask(&sets).get(proc_idx).copied().unwrap_or(false)
+        );
+
+        let rec_size = size_of::<SYSTEM_CPU_SET_INFORMATION>();
+        // SAFETY: POD struct whose padding/union bytes are valid when zeroed.
+        let zero_set: SYSTEM_CPU_SET_INFORMATION_0_0 = unsafe { std::mem::zeroed() };
+        let make_entry = |size: u32, id: u32, proc_index: u8, group: u16, class: u8| {
+            // SAFETY: zero-initialized POD struct populated field by field.
+            let mut info: SYSTEM_CPU_SET_INFORMATION = unsafe { std::mem::zeroed() };
+            info.Size = size;
+            info.Anonymous = SYSTEM_CPU_SET_INFORMATION_0 {
+                CpuSet: SYSTEM_CPU_SET_INFORMATION_0_0 {
+                    Id: id,
+                    Group: group,
+                    LogicalProcessorIndex: proc_index,
+                    EfficiencyClass: class,
+                    ..zero_set
+                },
+            };
+            info
+        };
+        let entries = [
+            make_entry(rec_size as u32, 0x101, 2, 0, 1),
+            make_entry(rec_size as u32, 0x102, 4, 1, 0),
+            make_entry(0, 0x103, 5, 0, 0),
+            make_entry(rec_size as u32, 0x104, 6, 0, 0),
+        ];
+        let mut buf = vec![0u64; (entries.len() * rec_size).div_ceil(8)];
+        // SAFETY: `entries` byte size fits in `buf`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                entries.as_ptr().cast::<u8>(),
+                buf.as_mut_ptr().cast::<u8>(),
+                entries.len() * rec_size,
+            );
+        }
+        assert_eq!(parse_cpu_sets(&buf, entries.len() * rec_size), vec![(0x101, 2, 1)]);
+        assert_eq!(parse_cpu_sets(&buf, rec_size), vec![(0x101, 2, 1)]);
+        assert_eq!(parse_cpu_sets(&buf, rec_size - 1), Vec::<(u32, u8, u8)>::new());
+
+        assert!(ready_to_flush(Duration::from_secs(5), false));
+        assert!(ready_to_flush(Duration::from_secs(6), false));
+        assert!(!ready_to_flush(Duration::from_millis(4999), false));
+        assert!(!ready_to_flush(Duration::from_secs(5), true));
+
+        let tu0 = thread_times().0;
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while (thread_times().0 == tu0 || thread_times().0 <= 1 || process_times().0 <= 1)
+            && Instant::now() < deadline
+        {
+            std::hint::black_box(1u64.wrapping_add(tu0));
+        }
+        assert!(thread_times().0 > 1);
+        assert!(process_times().0 > 1);
+
+        let faults0 = page_faults();
+        assert!(faults0 > 1);
+        let mut pages = vec![0u8; 2 << 20];
+        for (i, b) in pages.iter_mut().enumerate().step_by(4096) {
+            *b = i as u8;
+        }
+        std::hint::black_box(&pages);
+        assert!(page_faults() > faults0);
+
+        let avail = free_mb();
+        assert!(avail > 32 && avail < (1u64 << 30));
+        let s = sample();
+        assert!(s[S_PAGE_FAULTS] > 1 && s[S_FREE_MB] > 32 && s[S_FREE_MB] < (1u64 << 30));
+    }
+
+    #[test]
+    fn frame_lifecycle_accumulates_and_flushes_when_enabled() {
+        use std::time::{Duration, Instant};
+        if std::env::var_os("VICTORY_FRAME_LOG_CHILD").is_some() {
+            assert!(on());
+            let before_looks = total(T::RenderLooks);
+            super::frame();
+            assert_eq!(total(T::RenderLooks), before_looks + 1);
+            let tu0 = thread_times().0;
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while thread_times().0 == tu0 && Instant::now() < deadline {
+                std::hint::black_box(1u64.wrapping_add(tu0));
+            }
+            super::frame();
+            {
+                let state = STATE.lock().unwrap();
+                let st = state.as_ref().unwrap();
+                assert_eq!(st.frames.len(), 1);
+                assert_eq!(st.frames[0].number, 2);
+                assert!(st.frames[0].s[S_THREAD_USER] > 0.0);
+            }
+            std::thread::spawn(super::frame).join().unwrap();
+            {
+                let mut state = STATE.lock().unwrap();
+                let st = state.as_mut().unwrap();
+                assert_eq!(st.frames.len(), 2);
+                assert_eq!(st.frames[1].number, 3);
+                assert_eq!(st.frames[1].s[S_THREAD_USER], 0.0);
+                assert_eq!(st.frames[1].s[S_THREAD_KERNEL], 0.0);
+                st.recent.clear();
+                st.recent.push_back(100_000.0);
+                st.since = Instant::now() - Duration::from_secs(6);
+            }
+            super::frame();
+            {
+                let mut state = STATE.lock().unwrap();
+                let st = state.as_mut().unwrap();
+                assert!(st.frames.is_empty());
+                assert_eq!(st.recent.len(), 4);
+                while st.recent.len() < RECENT {
+                    st.recent.push_back(100_000.0);
+                }
+                st.since = Instant::now() - Duration::from_secs(6);
+            }
+            super::frame();
+            {
+                let state = STATE.lock().unwrap();
+                let st = state.as_ref().unwrap();
+                assert!(st.frames.is_empty());
+                assert_eq!(st.recent.len(), RECENT);
+            }
+            return;
+        }
+        assert_eq!(on(), cfg!(feature = "diagnostics"));
+        if !on() {
+            let before = total(T::RenderLooks);
+            super::frame();
+            assert_eq!(total(T::RenderLooks), before);
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .env("VICTORY_FRAME_LOG", "1")
+            .env("VICTORY_FRAME_LOG_CHILD", "1")
+            .args([
+                "--exact",
+                "framelog::tests::frame_lifecycle_accumulates_and_flushes_when_enabled",
+                "--nocapture",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 }
