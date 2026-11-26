@@ -9405,11 +9405,13 @@ impl Meter {
             {
                 let [own, asking, still, all] =
                     [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+                let passed = crate::texture::PASSED_OVER.swap(0, Ordering::Relaxed) as f64 / frames;
                 if all >= 1.0 {
                     tracing::info!(
                         "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
                          is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
-                         hold still (the runtime remapping it); the rest is reading, hashing and detiling"
+                         hold still (the runtime remapping it); the rest is reading, hashing and detiling; {passed:.1} refreshes passed \
+                         over, their memory hashed whole already in the frame"
                     );
                 }
                 let [through, left, filled, short] =
