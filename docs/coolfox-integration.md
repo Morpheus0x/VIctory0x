@@ -41,15 +41,29 @@ Our `descriptor-fix` (#89), `shader-lookup` (#88), `shader-ir-alloc` (#75) and
 `shader-atc-probe` (#186) are **not** ported: cool_fox already carries its own,
 newer code in those areas, and the patches conflict wholesale.
 
-## Launcher, config, cache, saves
+## Launchers, config, cache, saves
 
-- `build.bat` (workspace root): `cargo run -p xtask -- agility`, then
-  `cargo build --locked --profile diag -p victory --features diagnostics`.
-- `run.bat` (workspace root): rewrites `D:\GTA6\victory0x-data\victory.toml`
-  with cool_fox's schema
-  (`[paths] game_dir/cache_dir/data_dir`), exports the same values as
-  `VICTORY_*` variables, warms shaders with `victory shaders <shaders.rpf>` when
-  the exe hash changed, then streams UTF-8 into `logs\run.log`.
+`build.bat` and `run.bat` live in the repository root and carry **no paths**.
+Both accept the same arguments (`run` needs `--game` and `--data`; `build`
+ignores them, and both ignore the other's options):
+
+```
+--repo DIR [--game FILE] [--data DIR] [--profile NAME] [--target TRIPLE]
+[--features LIST] [--agility 0|1] [--exe FILE] [--log FILE] [--warm 0|1]
+[--skip-pipelines LIST] [--texture-back LIST] [-- title args...]
+```
+
+`build.bat` stages the Agility SDK (`--agility 1`) and runs
+`cargo build --locked --profile <profile> -p victory --features <features>`.
+`run.bat` warms shaders (`victory shaders <shaders.rpf>`, skipped when
+`warm.sha` matches the exe and `--warm 1`), exports `VICTORY_GAME_DIR`,
+`VICTORY_CACHE_DIR`, `VICTORY_DATA_DIR`, and streams UTF-8 into
+`<data>\logs\run.log`. The cache lives under `<data>\cache`, saves under
+`<data>\data\<TITLEID>`; no config file is required (environment values
+resolve cool_fox's `[paths]`).
+
+On this tree the 5-second frame line needs `victory_gpu::host=info`, which
+`run.bat` sets.
 - **Saves**: cool_fox stores persistent data at
   `<data_dir>\<TITLEID>\storage` and saves beside it — the same layout we used,
   so `D:\GTA6\victory0x-data\data\7952987A\storage` is picked up unchanged.
