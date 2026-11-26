@@ -36,7 +36,17 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
 };
 
-use super::dualsense::Reading;
+/// One pad state, as the HID reader keeps it (the shape gameinput reads).
+#[derive(Clone, Copy, Default, PartialEq)]
+pub struct Reading {
+    pub buttons: u32,
+    pub left_trigger: f32,
+    pub right_trigger: f32,
+    pub left_x: f32,
+    pub left_y: f32,
+    pub right_x: f32,
+    pub right_y: f32,
+}
 
 /// Pad buttons, the bits the title maps (same values as `gameinput`).
 const MENU: u32 = 0x1;
