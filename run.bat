@@ -24,7 +24,7 @@ if not exist "%EXE%" (
   exit /b 2
 )
 for %%D in ("%DATA%" "%CACHE%" "%DATADIR%" "%LOGS%") do if not exist "%%~D" mkdir "%%~D"
-set "BRANCH=dev"
+set "BRANCH=staging"
 for /f %%T in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "TS=%%T"
 set "LOG=%LOGS%\run_%TS%_%BRANCH%.log"
 
@@ -83,6 +83,10 @@ set VICTORY_PIPELINE_BOOK=1
 
 set "STAMP=%CACHE%\warm.sha"
 for /f %%H in ('powershell -NoProfile -Command "(Get-FileHash -Algorithm SHA256 -LiteralPath '%EXE%').Hash.ToLower()"') do set "SHA=%%H"
+rem The translator's output depends on the renderer ports (port 5 reads
+rem constant buffers raw): warm again when one of them changes, not only
+rem when the exe does.
+set "SHA=%SHA%_%VICTORY_PORT_CONSTANTS%%VICTORY_PORT_DESCRIPTORS%%VICTORY_PORT_CBV%%VICTORY_PORT_GUARD%%VICTORY_PORT_JOURNAL%"
 set "OLD="
 if exist "%STAMP%" for /f "usebackq delims=" %%S in ("%STAMP%") do set "OLD=%%S"
 if /i "%OLD%"=="%SHA%" goto pipelines
