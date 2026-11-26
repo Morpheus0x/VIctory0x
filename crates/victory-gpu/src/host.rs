@@ -9221,6 +9221,11 @@ struct Presenter {
     meter: Meter,
     /// Composes a second presented plane over the first ([`crate::compose`]).
     composer: Option<crate::compose::Composer>,
+    /// Draws the frame into the window's client area keeping its aspect
+    /// ([`crate::fit`]).
+    fit: Option<crate::fit::Fit>,
+    /// Making or recording the fit failed: the old fill is used from then on.
+    fit_failed: bool,
     panel: panel::Panel,
 }
 
@@ -9676,9 +9681,21 @@ impl Host {
             format
         };
         let (width, height) = (desc.Width as u32, desc.Height);
+        // A frame that can be sampled is drawn into the window's client
+        // area keeping its aspect ([`crate::fit`]); otherwise the swap chain
+        // follows the frame and DXGI stretches it to the window.
+        let mut fit_format = if planes.is_none() && aspect_fit() {
+            crate::compose::view(&desc)
+        } else {
+            None
+        };
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
-            *presenter = match self.presenter(width, height, format) {
+            let initial = match fit_format {
+                Some(_) => title_window().and_then(client_size).unwrap_or((width, height)),
+                None => (width, height),
+            };
+            *presenter = match self.presenter(initial.0, initial.1, format) {
                 Ok(p) => Some(p),
                 Err(e) => {
                     tracing::warn!(error = %e, "no swap chain");
@@ -9688,6 +9705,11 @@ impl Host {
         }
         let state_u32 = state;
         let p = presenter.as_mut()?;
+        // A new format needs pipelines built for it.
+        if p.format != format {
+            p.composer = None;
+            p.fit = None;
+        }
         if planes.is_some() && p.composer.is_none() {
             match crate::compose::Composer::new(self, format) {
                 Ok(c) => p.composer = Some(c),
@@ -9698,23 +9720,37 @@ impl Host {
                 }
             }
         }
-        if (p.width, p.height, p.format) != (width, height, format) {
+        if fit_format.is_some() && p.fit.is_none() && !p.fit_failed {
+            match crate::fit::Fit::new(self, format) {
+                Ok(fit) => p.fit = Some(fit),
+                Err(e) => {
+                    tracing::warn!(error = %e, "aspect fit not drawn; the picture fills the window");
+                    p.fit_failed = true;
+                    fit_format = None;
+                }
+            }
+        }
+        if p.fit_failed {
+            fit_format = None;
+        }
+        let target = match fit_format {
+            Some(_) => client_size(p.hwnd).unwrap_or((width, height)),
+            None => (width, height),
+        };
+        if (p.width, p.height, p.format) != (target.0, target.1, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(BUFFERS, target.0, target.1, format, DXGI_SWAP_CHAIN_FLAG(0))
             };
             match resized {
                 Ok(()) => {
-                    if p.format != format {
-                        p.composer = None;
-                    }
-                    (p.width, p.height, p.format) = (width, height, format);
+                    (p.width, p.height, p.format) = (target.0, target.1, format);
                     tracing::info!(
-                        width,
-                        height,
+                        width = target.0,
+                        height = target.1,
                         format = format.0,
                         frame,
                         "the swap chain's buffers were made again for another size or format"
@@ -9827,7 +9863,55 @@ impl Host {
             } else {
                 false
             };
-            if !composed {
+            let fitted = if composed {
+                false
+            } else if let Some(fit_format) = fit_format {
+                let mut pre = Vec::with_capacity(2);
+                if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                    pre.push(transition(
+                        texture,
+                        state,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    ));
+                }
+                pre.push(transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                ));
+                list.ResourceBarrier(&pre);
+                // The back buffer is the window's client area; the fit
+                // leaves the bars that the frame's aspect does not cover.
+                let Some(fit) = p.fit.as_mut() else { return None };
+                if let Err(err) = fit.record(
+                    self,
+                    slot.map_or(0, |i| i + 1),
+                    list,
+                    texture,
+                    fit_format,
+                    &back,
+                    (p.width, p.height),
+                ) {
+                    copy.close();
+                    p.fit = None;
+                    p.fit_failed = true;
+                    tracing::warn!(%err, "could not record the fitted picture; the picture fills the window from now on");
+                    return None;
+                }
+                let mut post = Vec::with_capacity(2);
+                post.push(transition(
+                    texture,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    state,
+                ));
+                post.push(transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                ));
+                list.ResourceBarrier(&post);
+                true
+            } else {
                 let mut pre = Vec::with_capacity(2);
                 if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
                     pre.push(transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE));
@@ -9839,11 +9923,12 @@ impl Host {
                 ));
                 list.ResourceBarrier(&pre);
                 list.CopyResource(&back, texture);
-            }
+                false
+            };
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| {
-                    if composed {
+                    if composed || fitted {
                         list.ResourceBarrier(&[transition(
                             &back,
                             D3D12_RESOURCE_STATE_COPY_DEST,
@@ -9862,21 +9947,21 @@ impl Host {
                 })
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() || composed {
+            let probe = if slot.is_some() || composed || fitted {
                 None
             } else {
                 crate::capture::probe(&self.device, list, texture)
             };
             #[cfg(feature = "diagnostics")]
-            let watched = if composed {
+            let watched = if composed || fitted {
                 None
             } else {
                 crate::popwatch::take(&self.device, list, texture)
             };
-            p.panel.draw(self, copy, &back, (width, height), format);
+            p.panel.draw(self, copy, &back, (p.width, p.height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            if composed {
+            if composed || fitted {
                 list.ResourceBarrier(&[transition(
                     &back,
                     D3D12_RESOURCE_STATE_COPY_DEST,
@@ -9940,14 +10025,9 @@ impl Host {
         height: u32,
         format: DXGI_FORMAT,
     ) -> windows::core::Result<Presenter> {
-        // A resized window, and the borderless fullscreen the title's
-        // Ctrl+Enter switches to, keep the picture's aspect: DXGI scales the
-        // buffers to fit and leaves bars where the window is wider or
-        // taller. `VICTORY_ASPECT=stretch` asks for the old fill instead.
-        let scaling = match std::env::var("VICTORY_ASPECT").as_deref().map(str::trim) {
-            Ok("stretch") => DXGI_SCALING_STRETCH,
-            _ => DXGI_SCALING_ASPECT_RATIO_STRETCH,
-        };
+        // The swap chain is at the size it is given: the title frame's, or
+        // (see [`present_planes`]) the window's client area when the frame
+        // is fitted into it with bars.
         let hwnd = match title_window() {
             Some(hwnd) => hwnd,
             None => window(width, height)?,
@@ -9967,7 +10047,7 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-                Scaling: scaling,
+                Scaling: DXGI_SCALING_STRETCH,
                 ..Default::default()
             };
             let swap_chain = factory
@@ -9987,6 +10067,8 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 composer: None,
+                fit: None,
+                fit_failed: false,
                 panel: panel::Panel::new(),
             })
         }
@@ -10014,6 +10096,23 @@ fn title_window() -> Option<HWND> {
     // SAFETY: the callback only writes `found`, which outlives the call.
     let _ = unsafe { EnumWindows(Some(visit), LPARAM(&raw mut found as isize)) };
     found
+}
+
+/// The client area of `hwnd`, when it has one (a window not minimized).
+fn client_size(hwnd: HWND) -> Option<(u32, u32)> {
+    let mut rect = RECT::default();
+    // SAFETY: a window handle; `rect` is ours.
+    unsafe { GetClientRect(hwnd, &mut rect).ok()? };
+    let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+    (width > 0 && height > 0).then_some((width as u32, height as u32))
+}
+
+/// Whether the picture is kept to its aspect: the swap chain's back buffer
+/// is the window's client area and the frame is drawn into it with bars
+/// ([`crate::fit`]). `VICTORY_ASPECT=stretch` asks for the old fill.
+fn aspect_fit() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_ASPECT").as_deref().map(str::trim) != Ok("stretch"))
 }
 
 /// `state` without the bits the host texture's flags forbid: the console
