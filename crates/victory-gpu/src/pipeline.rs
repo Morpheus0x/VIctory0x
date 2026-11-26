@@ -659,6 +659,157 @@ pub(crate) extern "system" fn create_compute_x(
     create_compute(this, desc, iid, out)
 }
 
+/// Parts `DeserializeComputePipelineStateX` (device slot 0x218) passes: the
+/// root signature, then a pointer and size for kinds 0, 1, 6 and 7 of an
+/// `FSPX` payload (`victory_shader::native::fspx_program`): the dispatch
+/// state, its hash, the RDNA2 program and its resource records. The
+/// FidelityFX upscaler builds them from a shader's `ACCC` part, and the
+/// title (title+0x24800d5) passes the same shape: the first word is the
+/// root signature its plain compute description would carry, and the pairs
+/// are the sections it holds. Kind 1 is optional.
+#[repr(C)]
+pub(crate) struct DeserializeComputeHead {
+    _root: This,
+    kind0: *const u8,
+    kind0_size: usize,
+    kind1: *const u8,
+    kind1_size: usize,
+    kind6: *const u8,
+    kind6_size: usize,
+    kind7: *const u8,
+    kind7_size: usize,
+}
+
+/// The most a section may be: kind 6 is at most 41,536 bytes in the
+/// upscaler's payloads, so 16 MiB is a bound no real payload comes near.
+const MAX_SECTION: usize = 16 << 20;
+
+/// A copy of one section a description names, `least` (what the FSPX reader
+/// reads) to `most` bytes long. Read through the kernel on Windows: a
+/// description of a shape this reader does not know may name memory that is
+/// not mapped, and reading it must not fault the title.
+fn section(ptr: *const u8, size: usize, least: usize, most: usize) -> Option<Vec<u8>> {
+    if ptr.is_null() || size < least || size > most {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        let mut out = vec![0u8; size];
+        crate::host::read_into(ptr, &mut out).then_some(out)
+    }
+    #[cfg(not(windows))]
+    {
+        // SAFETY: without a kernel to ask, the caller's word for the range.
+        Some(unsafe { std::slice::from_raw_parts(ptr, size) }.to_vec())
+    }
+}
+
+/// Device method 0x218: `DeserializeComputePipelineStateX`, a compute
+/// pipeline from a native program's `FSPX` sections. The sections are put
+/// back together as the payload they came from (a header and one entry per
+/// kind), the payload is carried as the `ACCC` part of a `DXBC` container,
+/// and that container is the pipeline's compute shader: translation then
+/// follows the path of any `ACCC` program (`victory_shader::native_programs`).
+///
+/// A description that is not consistent sections — a pointer with no size or
+/// a size with no pointer, a section over 16 MiB, no kind 0, 6 or 7, a
+/// payload the `FSPX` reader refuses, a program whose code does not decode —
+/// is answered with `E_INVALIDARG` and `out` null. The title then creates
+/// the pipeline from its plain compute description (0x1f0,
+/// `create_compute_x`) at once, as it does today, so a description this
+/// reader does not know costs it nothing.
+pub(crate) extern "system" fn deserialize_compute(
+    _: This,
+    desc: *const DeserializeComputeHead,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    if !out.is_null() {
+        // SAFETY: the title's out pointer (a local of its own).
+        unsafe { *out = std::ptr::null() };
+    }
+    // SAFETY: the title passes a description (null is tolerated).
+    let Some(desc) = (unsafe { desc.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    let Some(payload) = assemble_fspx(desc) else {
+        tracing::debug!("DeserializeComputePipelineStateX: the description is not FSPX sections");
+        return E_INVALIDARG;
+    };
+    // The FSPX reader is the judge: a program it refuses would be dropped at
+    // the first dispatch instead of here, where the title still falls back.
+    let Ok(programs) = victory_shader::native_programs(&payload) else {
+        tracing::debug!("DeserializeComputePipelineStateX: the FSPX payload is refused");
+        return E_INVALIDARG;
+    };
+    // Nor is a program taken for a pipeline when its code does not decode:
+    // the title would have no host pipeline and no plain description coming.
+    if programs.first().is_none_or(|p| victory_shader::gfx10::decode(&p.code).is_err()) {
+        tracing::debug!("DeserializeComputePipelineStateX: the program's code does not decode");
+        return E_INVALIDARG;
+    }
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let container =
+        victory_shader::dxbc::build(&[(victory_shader::FourCC::ACCC, payload.as_slice())]);
+    let hr = hand_out(
+        vec![shader("compute", &container)],
+        #[cfg(windows)]
+        None,
+        iid,
+        out,
+    );
+    if hr == object::S_OK && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!(
+            code = desc.kind6_size,
+            state = desc.kind0_size,
+            metadata = desc.kind7_size,
+            hash = desc.kind1_size,
+            programs = programs.len(),
+            "DeserializeComputePipelineStateX: compute pipelines from their FSPX sections"
+        );
+    }
+    hr
+}
+
+/// Puts the sections a description names back into the `FSPX` payload they
+/// came from: a 16-byte header, one 16-byte entry per kind, then each
+/// section at a 16-byte boundary. `None` when a pair does not hold.
+fn assemble_fspx(desc: &DeserializeComputeHead) -> Option<Vec<u8>> {
+    let state = section(desc.kind0, desc.kind0_size, 0x1c, 0x1000)?;
+    let code = section(desc.kind6, desc.kind6_size, 4, MAX_SECTION)?;
+    if code.len() % 4 != 0 {
+        return None;
+    }
+    let metadata = section(desc.kind7, desc.kind7_size, 0x18, 0x10000)?;
+    let hash = if desc.kind1_size == 0 && desc.kind1.is_null() {
+        None
+    } else {
+        Some(section(desc.kind1, desc.kind1_size, 1, 0x1000)?)
+    };
+    let mut sections: Vec<(u32, &[u8])> =
+        vec![(0, state.as_slice()), (6, code.as_slice()), (7, metadata.as_slice())];
+    if let Some(hash) = &hash {
+        sections.insert(1, (1, hash.as_slice()));
+    }
+    let header = 16 + 16 * sections.len();
+    let mut payload = vec![0u8; header];
+    for (i, &(kind, data)) in sections.iter().enumerate() {
+        let at = payload.len().next_multiple_of(16);
+        payload.resize(at, 0);
+        let entry = 16 + 16 * i;
+        payload[entry..entry + 4].copy_from_slice(&kind.to_le_bytes());
+        payload[entry + 4..entry + 8].copy_from_slice(&(at as u32).to_le_bytes());
+        payload[entry + 8..entry + 12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        payload.extend_from_slice(data);
+    }
+    let total = payload.len() as u32;
+    payload[0..4].copy_from_slice(b"FSPX");
+    payload[4..8].copy_from_slice(&1u32.to_le_bytes());
+    payload[8..12].copy_from_slice(&(sections.len() as u32).to_le_bytes());
+    payload[12..16].copy_from_slice(&total.to_le_bytes());
+    Some(payload)
+}
+
 /// A pipeline described as a stream: its size and the subobjects, each a
 /// type then its data, padded to 8 bytes.
 #[repr(C)]
@@ -813,7 +964,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::object::{S_OK, slot};
+    use crate::object::{E_INVALIDARG, S_OK, slot};
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
@@ -917,5 +1068,88 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    /// The description `DeserializeComputePipelineStateX` takes: the root
+    /// signature, then kinds 0, 1, 6 and 7 as pointer and size pairs.
+    #[test]
+    fn deserialize_compute_x_assembles_an_accc_compute_pipeline() {
+        // Kind 0, the dispatch state: 8×16×1 threads, wave32, one VGPR granule.
+        let mut state = [0u8; 0x1c];
+        state[0x0c..0x0e].copy_from_slice(&8u16.to_le_bytes());
+        state[0x0e..0x10].copy_from_slice(&16u16.to_le_bytes());
+        state[0x10..0x12].copy_from_slice(&1u16.to_le_bytes());
+        state[0x12..0x14].copy_from_slice(&(1u16 << 4).to_le_bytes());
+        let hash = [0x11u8; 0x14];
+        // One s_endpgm dword; the metadata's word 2 names that many dwords.
+        let code = [0x00u8, 0x00, 0x81, 0xbf];
+        let mut metadata = [0u8; 0x18 + 32];
+        let meta_size = (metadata.len() - 0x14) as u32;
+        metadata[0..4].copy_from_slice(&0x403u32.to_le_bytes());
+        metadata[4..8].copy_from_slice(&meta_size.to_le_bytes());
+        metadata[8..12].copy_from_slice(&(code.len() as u32 / 4).to_le_bytes());
+        metadata[0x14] = 0x40;
+        metadata[0x18] = 0x43; // the hash record ends the list
+        let desc = DeserializeComputeHead {
+            _root: std::ptr::null(),
+            kind0: state.as_ptr(),
+            kind0_size: state.len(),
+            kind1: hash.as_ptr(),
+            kind1_size: hash.len(),
+            kind6: code.as_ptr(),
+            kind6_size: code.len(),
+            kind7: metadata.as_ptr(),
+            kind7_size: metadata.len(),
+        };
+        let mut p = std::ptr::null();
+        assert_eq!(
+            deserialize_compute(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+            S_OK
+        );
+        assert!(!p.is_null());
+        let kept = shaders(p);
+        let (stage, container) = &kept[0];
+        assert_eq!(*stage, "compute");
+        let c = victory_shader::Container::parse(container).unwrap();
+        let part = c.part(victory_shader::FourCC::ACCC).unwrap();
+        let programs = victory_shader::native_programs(part.data).unwrap();
+        assert_eq!(programs.len(), 1);
+        assert_eq!(programs[0].stage, victory_shader::HwStage::Cs);
+        assert_eq!(programs[0].code, code);
+        assert!(!programs[0].wave64);
+        object::release_boxed::<Pipeline>(p);
+    }
+
+    #[test]
+    fn deserialize_compute_x_refuses_descriptions_that_are_not_sections() {
+        let mut p = std::ptr::null();
+        assert_eq!(
+            deserialize_compute(std::ptr::null(), std::ptr::null(), &PIPELINE_IIDS[0], &mut p),
+            E_INVALIDARG
+        );
+        assert!(p.is_null());
+        // Kinds 0 and 7 and a code size, but no code.
+        let state = [0u8; 0x1c];
+        let mut metadata = [0u8; 0x18 + 32];
+        metadata[0..4].copy_from_slice(&0x403u32.to_le_bytes());
+        metadata[8..12].copy_from_slice(&1u32.to_le_bytes());
+        metadata[0x18] = 0x43;
+        let desc = DeserializeComputeHead {
+            _root: std::ptr::null(),
+            kind0: state.as_ptr(),
+            kind0_size: state.len(),
+            kind1: std::ptr::null(),
+            kind1_size: 0,
+            kind6: std::ptr::null(),
+            kind6_size: 4,
+            kind7: metadata.as_ptr(),
+            kind7_size: metadata.len(),
+        };
+        let mut p = std::ptr::null();
+        assert_eq!(
+            deserialize_compute(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+            E_INVALIDARG
+        );
+        assert!(p.is_null());
     }
 }

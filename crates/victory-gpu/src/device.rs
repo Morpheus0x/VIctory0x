@@ -346,25 +346,31 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
-/// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
-/// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
-/// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
+/// Device method 0x1c8: `DeserializeGraphicsPipelineStateX`, the reader of
+/// what `SerializePipelineStateX` (0x1c0) writes. The title calls it
+/// (title+0x2477578) as `(this, serialised state, interface id, out)`,
+/// asks for `ID3D12PipelineState`, and keeps the object `out` names; on
+/// failure it has nothing to draw with at that site. The state is what the
+/// console's `SerializePipelineStateX` wrote — the driver's own form of a
+/// pipeline, not a description a host driver can take — so the call fails
+/// with `out` null, as XCL's device slot 57 does; the title's own pipelines
+/// are made from its descriptions (streams, 0x2b0: tens of thousands of
+/// calls in a run).
+/// Its sibling 0x218, `DeserializeComputePipelineStateX`, takes an `FSPX`
+/// program's sections rather than the driver's serialised form and is
+/// written (`pipeline::deserialize_compute`).
+/// The first calls log the state's words and what its first word points at.
 /// shortcut: not implemented. Answering `S_OK` here without making the
 /// pipeline would hand the title whatever its stack held as an object.
-extern "system" fn unknown_pipeline<const SLOT: usize>(
+extern "system" fn deserialize_graphics(
     _: This,
     desc: *const u8,
     _iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     use std::sync::atomic::{AtomicU32, Ordering};
-    static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
-    let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
@@ -388,13 +394,21 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
-        tracing::warn!(
-            slot = format_args!("{:#x}", SLOT),
-            calls,
-            description = format_args!("{description:x?}"),
-            first_points_at = format_args!("{first:x?}"),
-            "a pipeline creation method that is not implemented: the title goes without this pipeline"
-        );
+        if calls == 1 {
+            tracing::info!(
+                calls,
+                description = format_args!("{description:x?}"),
+                first_points_at = format_args!("{first:x?}"),
+                "DeserializeGraphicsPipelineStateX: the console driver's serialised pipeline is declined; the title's pipelines come from its stream descriptions"
+            );
+        } else {
+            tracing::debug!(
+                calls,
+                description = format_args!("{description:x?}"),
+                first_points_at = format_args!("{first:x?}"),
+                "DeserializeGraphicsPipelineStateX: the console driver's serialised pipeline is declined"
+            );
+        }
     }
     E_NOTIMPL
 }
@@ -449,10 +463,10 @@ static FUNCTIONS: Table<160> = {
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
-    f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
+    f[57] = deserialize_graphics as *const (); // 0x1c8 DeserializeGraphicsPipelineStateX
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
-    f[67] = unknown_pipeline::<0x218> as *const (); // 0x218
+    f[67] = pipeline::deserialize_compute as *const (); // 0x218 DeserializeComputePipelineStateX
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238
