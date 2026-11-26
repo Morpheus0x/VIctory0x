@@ -7,7 +7,7 @@ performance work stands.
 
 - Upstream: <https://github.com/Belobug/VIctory-Belobug-AMD>
 - Fork: <https://github.com/Morpheus0x/VIctory0x>
-- `main` mirrors upstream (`4f62c2a`), `dev` is the integration branch (`c133826`).
+- `main` mirrors upstream (`4f62c2a`), `dev` is the integration branch (`7d71a19`; last upstream rebase at `c133826`).
 
 ## Target environment
 
