@@ -26,7 +26,7 @@ if not exist "%EXE%" (
 for %%D in ("%DATA%" "%CACHE%" "%DATADIR%" "%LOGS%") do if not exist "%%~D" mkdir "%%~D"
 set "BRANCH=coolfox"
 for /f %%T in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "TS=%%T"
-set "LOG=%LOGS%\run_%BRANCH%_%TS%.log"
+set "LOG=%LOGS%\run_%TS%_%BRANCH%.log"
 
 goto body
 
@@ -67,6 +67,10 @@ set VICTORY_JOIN_PARTS=8
 set VICTORY_UPLOAD_AHEAD=1
 rem The fork's own render settings (scripts/play.ps1).
 set VICTORY_AMBIENT=0.8
+set VICTORY_WINDOW_MAX=1920x1080
+rem Record the pipelines the title creates, so `victory warm --used` can make
+rem them ahead of later runs (one entry per new pipeline; tiny).
+set VICTORY_PIPELINE_BOOK=1
 rem This fork translates the pipelines the old skip list worked around.
 set VICTORY_SKIP_PIPELINES=none
 
@@ -74,7 +78,7 @@ set "STAMP=%CACHE%\warm.sha"
 for /f %%H in ('powershell -NoProfile -Command "(Get-FileHash -Algorithm SHA256 -LiteralPath '%EXE%').Hash.ToLower()"') do set "SHA=%%H"
 set "OLD="
 if exist "%STAMP%" for /f "usebackq delims=" %%S in ("%STAMP%") do set "OLD=%%S"
-if /i "%OLD%"=="%SHA%" goto run
+if /i "%OLD%"=="%SHA%" goto pipelines
 
 :warm
 echo [warm] translating every shader for this build into %CACHE%
@@ -88,6 +92,12 @@ if errorlevel 1 (
 ) else (
   >"%STAMP%" echo %SHA%
 )
+
+:pipelines
+if not exist "%CACHE%\pipelines\known-pipelines.bin" goto run
+echo [warm] making host pipelines earlier runs recorded (victory warm --used)
+"%EXE%" warm --used
+if errorlevel 1 echo [!] pipeline warm-up failed - running anyway
 
 :run
 echo === run %DATE% %TIME% === >> "%LOG%"
