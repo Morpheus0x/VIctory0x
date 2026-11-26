@@ -13,7 +13,6 @@ if not defined REPO set "REPO=%CD%"
 set "CACHE=%DATA%\cache"
 set "DATADIR=%DATA%\data"
 set "LOGS=%DATA%\logs"
-set "LOG=%LOGS%\run.log"
 set "EXE=%REPO%\target\diag\victory.exe"
 
 if not exist "%GAME%" (
@@ -25,6 +24,9 @@ if not exist "%EXE%" (
   exit /b 2
 )
 for %%D in ("%DATA%" "%CACHE%" "%DATADIR%" "%LOGS%") do if not exist "%%~D" mkdir "%%~D"
+set "BRANCH=coolfox"
+for /f %%T in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "TS=%%T"
+set "LOG=%LOGS%\run_%BRANCH%_%TS%.log"
 
 goto body
 
@@ -41,7 +43,8 @@ exit /b 2
 set "VICTORY_GAME_DIR=%GAMEDIR%"
 set "VICTORY_CACHE_DIR=%CACHE%"
 set "VICTORY_DATA_DIR=%DATADIR%"
-set VICTORY_LOG=warn,victory_gpu::host=info
+rem Quiet by default; add victory_gpu::host=info for the 5-second frame breakdown.
+if not defined VICTORY_LOG set VICTORY_LOG=warn
 set RUST_BACKTRACE=1
 rem The fork's own launcher (scripts/play.ps1) enables these; without them
 rem THIN lists, joined submissions, relay/land and card steps stay off.
@@ -62,9 +65,8 @@ set VICTORY_D3D12_DRED=light
 set VICTORY_THIN=1
 set VICTORY_JOIN_PARTS=8
 set VICTORY_UPLOAD_AHEAD=1
-rem The dev branch's look: the constant ambient rather than this fork's
-rem screen-radiance estimate. The fork's own choice is VICTORY_AMBIENT=0.8.
-set VICTORY_AMBIENT=constant:0.6
+rem The fork's own render settings (scripts/play.ps1).
+set VICTORY_AMBIENT=0.8
 rem This fork translates the pipelines the old skip list worked around.
 set VICTORY_SKIP_PIPELINES=none
 
