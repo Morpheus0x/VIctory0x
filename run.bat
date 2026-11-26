@@ -72,8 +72,6 @@ set VICTORY_WINDOW_MAX=1920x1080
 rem Record the pipelines the title creates, so `victory warm --used` can make
 rem them ahead of later runs (one entry per new pipeline; tiny).
 set VICTORY_PIPELINE_BOOK=1
-rem This fork translates the pipelines the old skip list worked around.
-set VICTORY_SKIP_PIPELINES=none
 
 set "STAMP=%CACHE%\warm.sha"
 for /f %%H in ('powershell -NoProfile -Command "(Get-FileHash -Algorithm SHA256 -LiteralPath '%EXE%').Hash.ToLower()"') do set "SHA=%%H"
@@ -83,8 +81,8 @@ if /i "%OLD%"=="%SHA%" goto pipelines
 
 :warm
 echo [warm] translating every shader for this build into %CACHE%
-if exist "%GAMEDIR%shaders.rpf" (
-  "%EXE%" shaders "%GAMEDIR%shaders.rpf"
+if exist "%GAMEDIR%\shaders.rpf" (
+  "%EXE%" shaders "%GAMEDIR%\shaders.rpf"
 ) else (
   "%EXE%" shaders "%GAMEDIR%"
 )
