@@ -71,6 +71,12 @@ rem Stopgap until the sky-following ambient is ported onto this tree: the
 rem constant beloooo used, instead of the screen-radiance estimate.
 set VICTORY_AMBIENT=constant:0.6
 set VICTORY_WINDOW_MAX=1920x1080
+rem The title renders at the window's 1080p instead of 4K (far less card
+rem time; presentation keeps the aspect with bars).
+set VICTORY_OUTPUT=1920x1080
+rem Let the title go above its 30 fps menu/video interval when the machine
+rem keeps up; the game's own clock stays right.
+set VICTORY_FRAME_INTERVAL_MS=16.667
 rem Record the pipelines the title creates, so `victory warm --used` can make
 rem them ahead of later runs (one entry per new pipeline; tiny).
 set VICTORY_PIPELINE_BOOK=1
