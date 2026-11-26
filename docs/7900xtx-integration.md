@@ -3,14 +3,23 @@
 Source: <https://github.com/avatarmanz/VIctory-7900XTX>, `main` at `0ce46d5`
 (2026-11-26). Branch: `dev-7900xtx`, based on our `dev` at `f425067`.
 
-## It is a different lineage, not a fork of ours
+## It shares our history up to `8e79c80`, then both sides moved far
 
-Its README names **Marvisak/VIctory** as its base and its history is a fresh
-`Initial commit` (758 commits, 236 merges, 258 files). Our tree descends from
-**Belobug/VIctory-Belobug-AMD** (186 files). No commit is shared, so git treats
-every change as foreign; there is no merge base to merge along.
+Earlier I said there was no shared base — that was wrong. The GitHub compare API
+returns 404 for a range this size, which misled me; a local `git merge-base`
+finds the real one.
 
-The code bases are closely related in places and far apart in others:
+`avatarmanz/VIctory-7900XTX` and our upstream share history up to
+**`8e79c80` (2026-11-24, "CI: clippy and tests on pull requests and main")**.
+Since that commit:
+
+- Our side (`main`): **550 commits**.
+- Their side: **557 commits**.
+
+Both are the same original port (`f4504f6 Initial commit`, 2026-11-23), but the
+two lines rewrote the same files independently for ~550 commits each, mostly
+from different PR streams. That, not unrelatedness, is why the same file has
+different structure on each side:
 
 | File | Theirs | Ours |
 |---|---:|---:|
@@ -24,6 +33,10 @@ The code bases are closely related in places and far apart in others:
 They also carry whole modules we do not have (`port.rs`, `port_descriptors.rs`,
 `inplace.rs`, `land.rs`, `list/thin.rs`, the `host/` split), and they have no
 Steam Controller module, no Win10 Agility work and none of our HLE fixes.
+
+A true three-way merge is therefore possible in principle but would be a
+557-commit merge with conflicts in ~100 commits' worth of GPU code — the
+per-commit cherry-pick scan below is the practical way to triage it.
 
 ## What was tested
 
