@@ -10,7 +10,10 @@
 //! compiled when a draw wants it. Making all of them in the running title
 //! (`VICTORY_EARLY_ALL=1`) ended it inside the driver's compiler; made here,
 //! a compiler that crashes or hangs ends a child process, costs that pipeline
-//! alone and is named in `warm-bad.txt`.
+//! alone and is named in `warm-bad.txt` under the driver, adapter and
+//! translation that saw it. Another driver or translation tries those again,
+//! and a pipeline that ended one compiler is tried once more before it is
+//! left out (see [`bad_keys`]).
 //!
 //! Two files beside the library, both only ever added to (a torn end is cut
 //! off): `known-shaders.bin` (stage, hash, length, container) and
@@ -255,6 +258,120 @@ pub fn fingerprint() -> String {
         h.update(&host.driver().to_le_bytes());
     }
     h.finalize().to_hex()[..16].to_owned()
+}
+
+/// `warm-bad.txt` beside the library: the pipelines the driver's compiler
+/// ended, one to a line (the key, then why), under the header of
+/// [`BAD_HEADER`]. The runs leave them out (a draw or dispatch with one is
+/// dropped), and `victory warm` does not try them again.
+pub const BAD_FILE: &str = "warm-bad.txt";
+/// How [`BAD_FILE`] begins: `# bad under <bad_fingerprint>`. Entries under
+/// another header were written by another driver, adapter or translation
+/// and are tried again: the change may have fixed what ended the compiler.
+pub const BAD_HEADER: &str = "# bad under ";
+/// How many times a pipeline may end the compiler under one driver and
+/// translation before it is left out. After the first it is tried once
+/// more in a new process (AMD's compiler ends on a different pipeline in
+/// every run); if it ends that one too it waits for a change of the driver
+/// or of the translation. `VICTORY_WARM_BAD=0` tries it at once.
+pub const BAD_TRIES: usize = 2;
+
+/// A pipeline [`BAD_FILE`] lists under the current [`bad_fingerprint`].
+pub struct Bad {
+    /// The title pipeline's key.
+    pub key: String,
+    /// Why it was last put there.
+    pub why: String,
+    /// How many times it was recorded: [`BAD_TRIES`] of them leave it out.
+    pub times: usize,
+}
+
+/// What a [`BAD_FILE`] entry is kept under: what the driver's cached
+/// pipelines depend on ([`fingerprint`]) and the adapter, since a compiler
+/// crash is the driver's and a PC may keep one cache for more than one GPU.
+pub fn bad_fingerprint() -> String {
+    let (vendor, device) = crate::host::host().map_or((0, 0), |h| h.adapter_ids());
+    format!("{}-{vendor:04x}{device:04x}", fingerprint())
+}
+
+/// The pipelines [`BAD_FILE`] in `dir` lists under the current
+/// [`bad_fingerprint`], each with why and how many times; empty if the list
+/// is from another driver, adapter or translation: those entries are stale
+/// and are tried again.
+pub fn bad_keys(dir: &Path) -> Vec<Bad> {
+    let path = dir.join(BAD_FILE);
+    let Ok(listed) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let current = listed
+        .lines()
+        .next()
+        .and_then(|first| first.strip_prefix(BAD_HEADER))
+        .is_some_and(|fp| fp.trim() == bad_fingerprint());
+    if !current {
+        if listed.lines().any(|line| !line.trim().is_empty()) {
+            tracing::info!(
+                file = %path.display(),
+                "the pipelines the driver's compiler ended are listed under another driver, adapter or translation: they are tried again"
+            );
+        }
+        return Vec::new();
+    }
+    let mut all: Vec<Bad> = Vec::new();
+    for line in listed.lines().skip(1) {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.splitn(2, char::is_whitespace);
+        let Some(key) = parts.next().filter(|key| !key.is_empty()) else {
+            continue;
+        };
+        let why = parts.next().unwrap_or_default().trim();
+        match all.iter_mut().find(|bad| bad.key == key) {
+            Some(bad) => {
+                bad.times += 1;
+                if !why.is_empty() {
+                    bad.why = why.to_owned();
+                }
+            }
+            None => all.push(Bad {
+                key: key.to_owned(),
+                why: why.to_owned(),
+                times: 1,
+            }),
+        }
+    }
+    all
+}
+
+/// Adds `line` (`<key> <why>`) to [`BAD_FILE`] in `dir`, under the current
+/// [`bad_fingerprint`]'s header: a list of another driver, adapter or
+/// translation is replaced, its entries being stale.
+pub fn note_bad(dir: &Path, line: &str) {
+    static WRITING: Mutex<()> = Mutex::new(());
+    let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    let path = dir.join(BAD_FILE);
+    let header = format!("{BAD_HEADER}{}\n", bad_fingerprint());
+    let current = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| text.lines().next().map(|first| first == header.trim_end()));
+    let written = if current == Some(true) {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| writeln!(file, "{line}"))
+    } else {
+        std::fs::write(&path, format!("{header}{line}\n"))
+    };
+    if let Err(e) = written {
+        tracing::warn!(
+            error = %e,
+            file = %path.display(),
+            "the pipeline the compiler ended is not left out of the next runs"
+        );
+    }
 }
 
 /// The translations of earlier runs are in `dir` (the pipeline library is

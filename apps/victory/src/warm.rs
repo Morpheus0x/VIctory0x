@@ -35,7 +35,6 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     victory_hle::known_pipelines::use_translations(dir.with_file_name("shaders"));
     let fingerprint = known::fingerprint();
     let done_file = dir.join("warm-done.txt");
-    let bad_file = dir.join("warm-bad.txt");
     let keys = known::keys(&dir);
     let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
     let mut done: HashSet<&str> = HashSet::new();
@@ -46,8 +45,14 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
             done.insert(key);
         }
     }
-    let bad = std::fs::read_to_string(&bad_file).unwrap_or_default();
-    let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
+    // Only those left out under this driver, adapter and translation: a list
+    // of another's entries was tried again by now, and one that ended the
+    // compiler once is tried once more here (see `known::bad_keys`).
+    let bad: HashSet<String> = known::bad_keys(&dir)
+        .into_iter()
+        .filter(|bad| bad.times >= known::BAD_TRIES)
+        .map(|bad| bad.key)
+        .collect();
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
     let early: HashSet<&str> = early.lines().collect();
     // Those earlier runs drew with first, the others in no order (by key).
@@ -62,7 +67,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let jobs = jobs.unwrap_or(cores * 2 / 3).max(1);
     println!(
-        "{} pipelines known, {} made before ({fingerprint}), {} bad; {} to make, {jobs} processes",
+        "{} pipelines known, {} made before ({fingerprint}), {} left out; {} to make, {jobs} processes",
         keys.len(),
         done.len(),
         bad.len(),
@@ -72,7 +77,8 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let done_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&done_file)?);
     // (Read back by the runs: these are made beside the others, not before.)
     let slow_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(dir.join("slow-pipelines.txt"))?);
-    let bad_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&bad_file)?);
+    // Written under the run's own driver and translation (`known::note_bad`),
+    // so a list from another is replaced instead of added to.
     run_batches(
         &all,
         jobs,
@@ -93,7 +99,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         },
         |n, why| {
             println!("pipeline {n} {}: {why}", keys[n]);
-            let _ = writeln!(lock(&bad_out), "{} {why}", keys[n]);
+            known::note_bad(&dir, &format!("{} {why}", keys[n]));
             lock(&state).2 += 1;
         },
     )?;

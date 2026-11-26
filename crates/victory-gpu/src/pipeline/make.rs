@@ -37,6 +37,8 @@ pub(crate) struct Pending {
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    /// Why it is left out (the driver's compiler ended on it), if it is.
+    bad: OnceLock<String>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
@@ -66,6 +68,7 @@ impl Pending {
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
+            bad: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
         }
@@ -80,9 +83,17 @@ impl Pending {
         // crashed under stays inside the call for good (see [`guard_start`]),
         // and anyone else asking would wait for it forever.
         if self.made.get().is_none() {
-            let made = if is_bad_key(&self.key) {
+            let made = if let Some(why) = bad_reason(&self.key) {
                 SKIPPED_BAD.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(key = self.key, shaders = ?self.shaders, "not made: the driver's compiler crashed on it before");
+                let _ = self.bad.set(why.clone());
+                tracing::warn!(
+                    key = self.key,
+                    shaders = ?self.shaders,
+                    names = ?title_names(&self.shaders),
+                    why = %why,
+                    file = %bad_file(),
+                    "not made: the driver's compiler crashed on it before; it waits for a change of the driver or of the translation (VICTORY_WARM_BAD=0: try it now)"
+                );
                 None
             } else {
                 let _building = crate::timeline::span("pipeline: build a host pipeline");
@@ -103,33 +114,75 @@ impl Pending {
 /// crashes on.
 static SKIPPED_BAD: AtomicU64 = AtomicU64::new(0);
 
-/// The keys of the pipelines the driver's compiler crashed on
-/// (`warm-bad.txt` beside the pipeline library, one key to a line, then
-/// anything; `#` begins a comment), loaded on first use. `VICTORY_WARM_BAD=0`
-/// leaves the file unread.
-static BAD_KEYS: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+/// The pipelines the driver's compiler ended and that are left out, by key
+/// and why (`super::known::BAD_FILE`, loaded on first use). Only those
+/// recorded `super::known::BAD_TRIES` times under this driver, adapter and
+/// translation are here: one crash is tried again in a new process, and a
+/// new driver or translation tries them all (see `super::known::bad_keys`).
+/// `VICTORY_WARM_BAD=0` leaves the file unread.
+static BAD_KEYS: Mutex<Option<std::collections::HashMap<String, String>>> = Mutex::new(None);
 
-fn bad_keys<R>(f: impl FnOnce(&mut std::collections::HashSet<String>) -> R) -> R {
+fn bad_keys<R>(f: impl FnOnce(&mut std::collections::HashMap<String, String>) -> R) -> R {
     let mut keys = BAD_KEYS.lock().unwrap_or_else(|e| e.into_inner());
     let keys = keys.get_or_insert_with(|| {
         if std::env::var_os("VICTORY_WARM_BAD").is_some_and(|v| v == "0") {
             return Default::default();
         }
-        let listed = super::library::folder()
-            .and_then(|d| std::fs::read_to_string(d.join("warm-bad.txt")).ok())
-            .unwrap_or_default();
+        let listed = super::library::folder().map_or_else(Vec::new, |d| super::known::bad_keys(&d));
+        let retried = listed.iter().filter(|bad| bad.times < super::known::BAD_TRIES).count();
+        if retried > 0 {
+            tracing::info!(
+                retried,
+                "pipelines the driver's compiler ended once are tried again (VICTORY_WARM_BAD=0: all of them)"
+            );
+        }
         listed
-            .lines()
-            .filter(|l| !l.trim_start().starts_with('#'))
-            .filter_map(|l| l.split_whitespace().next())
-            .map(str::to_owned)
+            .into_iter()
+            .filter(|bad| bad.times >= super::known::BAD_TRIES)
+            .map(|bad| (bad.key, bad.why))
             .collect()
     });
     f(keys)
 }
 
-fn is_bad_key(key: &str) -> bool {
-    bad_keys(|keys| keys.contains(key))
+fn bad_reason(key: &str) -> Option<String> {
+    bad_keys(|keys| keys.get(key).cloned())
+}
+
+/// Where the list of pipelines the compiler ended is, for the logs.
+fn bad_file() -> String {
+    super::library::folder().map_or_else(String::new, |dir| dir.join(super::known::BAD_FILE).display().to_string())
+}
+
+/// The names the title gave the programs in `shaders` (`CS_...`), for the
+/// logs: a hash alone names no pass, and whether leaving one out costs
+/// frames or only looks depends on which it is.
+fn title_names(shaders: &[Arc<Shader>]) -> Vec<String> {
+    shaders.iter().filter_map(|shader| title_name(&shader.container)).collect()
+}
+
+/// The first program name in a container: a stage prefix and the name the
+/// shader was built under (the title keeps them in its DXIL bitcode).
+fn title_name(container: &[u8]) -> Option<String> {
+    const PREFIXES: [&[u8]; 4] = [b"CS_", b"PS_", b"VS_", b"MS_"];
+    for at in 0..container.len().saturating_sub(5) {
+        let Some(prefix) = PREFIXES.iter().find(|prefix| container[at..].starts_with(*prefix)) else {
+            continue;
+        };
+        if !container[at + 3].is_ascii_uppercase() {
+            continue;
+        }
+        let name: Vec<u8> = container[at..]
+            .iter()
+            .copied()
+            .take(64)
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .collect();
+        if name.len() > prefix.len() + 2 {
+            return Some(String::from_utf8_lossy(&name).into_owned());
+        }
+    }
+    None
 }
 
 /// Whether the driver's compiler crashes are caught
@@ -289,17 +342,17 @@ fn lost(slot: usize) {
     tracing::error!(
         key = p.key,
         shaders = ?p.shaders,
+        names = ?title_names(&p.shaders),
         rip = format_args!("{:#x}", FAULT_RIP[slot].load(Ordering::Relaxed)),
         address = format_args!("{:#x}", FAULT_ADDR[slot].load(Ordering::Relaxed)),
-        "the driver's compiler crashed making a pipeline: it is left out, the worker is replaced"
+        file = %bad_file(),
+        "the driver's compiler crashed making a pipeline: it is left out of this run, the worker is replaced; recorded, and a new run tries it once more unless it is listed twice"
     );
-    let known = bad_keys(|keys| !keys.insert(p.key.clone()));
-    if !known && let Some(dir) = super::library::folder() {
-        use std::io::Write;
-        let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("warm-bad.txt"));
-        if let Ok(mut f) = file {
-            let _ = writeln!(f, "{} ended the compiler in a run: {:?}", p.key, p.shaders);
-        }
+    let why = format!("ended the compiler in a run: {:?}", p.shaders);
+    let _ = p.bad.set(why.clone());
+    let _ = bad_keys(|keys| keys.insert(p.key.clone(), why.clone()));
+    if let Some(dir) = super::library::folder() {
+        super::known::note_bad(&dir, &format!("{} {why}", p.key));
     }
     let _ = p.made.set(None);
     if p.was_slow.swap(false, Ordering::Relaxed) {
@@ -328,6 +381,9 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
         Some(Some(_)) => None,
         None => Some("being made".into()),
         Some(None) => {
+            if let Some(why) = p.bad.get() {
+                return Some(format!("left out: {why}"));
+            }
             let failed: Vec<String> = p
                 .shaders
                 .iter()
@@ -759,7 +815,7 @@ mod tests {
     fn a_pipeline_on_the_bad_list_is_not_compiled() {
         let mut p = Pending::new(Vec::new(), None);
         p.key = "bad-pipeline-test".to_owned();
-        bad_keys(|keys| keys.insert(p.key.clone()));
+        let _ = bad_keys(|keys| keys.insert(p.key.clone(), "ended the compiler in a run: []".to_owned()));
         let before = SKIPPED_BAD.load(Ordering::Relaxed);
         p.make();
         assert!(matches!(p.made.get(), Some(None)));
