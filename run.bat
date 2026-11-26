@@ -43,8 +43,30 @@ set "VICTORY_CACHE_DIR=%CACHE%"
 set "VICTORY_DATA_DIR=%DATADIR%"
 set VICTORY_LOG=warn,victory_gpu::host=info
 set RUST_BACKTRACE=1
-set VICTORY_AMBIENT=0.6
-set VICTORY_SKIP_PIPELINES=4e35b816f2f91d68,b3ba0ef9ee352720,5d627391703fcb4c,ec6e4c363cf9ef2b,c89489afd89ee7f0,45f081396c2c59ba,63083c777948927a,0bd4d80ad23b106b
+rem The fork's own launcher (scripts/play.ps1) enables these; without them
+rem THIN lists, joined submissions, relay/land and card steps stay off.
+set VICTORY_TEXTURE_NO_WAIT=1
+set VICTORY_RELAY=2
+set VICTORY_WIDE_BACK=1
+set VICTORY_CARD_REHASH_RUNS=1
+set VICTORY_JOIN_COPIES=1
+set VICTORY_INDIRECT_WINDOW=1
+set VICTORY_RELAY_COPY=1
+set VICTORY_CARD_STEPS=2
+set VICTORY_INDIRECT_BATCH=2
+set VICTORY_MAP_THREADS=1
+set VICTORY_TITLE_PRIORITIES=0
+set VICTORY_CARD_AWAKE=1
+set VICTORY_SHOW_AFTER=1
+set VICTORY_D3D12_DRED=light
+set VICTORY_THIN=1
+set VICTORY_JOIN_PARTS=8
+set VICTORY_UPLOAD_AHEAD=1
+rem The dev branch's look: the constant ambient rather than this fork's
+rem screen-radiance estimate. The fork's own choice is VICTORY_AMBIENT=0.8.
+set VICTORY_AMBIENT=constant:0.6
+rem This fork translates the pipelines the old skip list worked around.
+set VICTORY_SKIP_PIPELINES=none
 
 set "STAMP=%CACHE%\warm.sha"
 for /f %%H in ('powershell -NoProfile -Command "(Get-FileHash -Algorithm SHA256 -LiteralPath '%EXE%').Hash.ToLower()"') do set "SHA=%%H"
