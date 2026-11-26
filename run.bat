@@ -43,8 +43,10 @@ exit /b 2
 set "VICTORY_GAME_DIR=%GAMEDIR%"
 set "VICTORY_CACHE_DIR=%CACHE%"
 set "VICTORY_DATA_DIR=%DATADIR%"
-rem Quiet by default; add victory_gpu::host=info for the 5-second frame breakdown.
-if not defined VICTORY_LOG set VICTORY_LOG=warn
+rem Quiet, but keep the 5-second frame breakdown and the title's own frame
+rem timer: that is this base's replacement for the old frame.log.
+if not defined VICTORY_LOG set VICTORY_LOG=warn,victory_gpu::host=info,victory_gpu::queue=info
+set VICTORY_TIMER_LOG=1
 set RUST_BACKTRACE=1
 rem The fork's own launcher (scripts/play.ps1) enables these; without them
 rem THIN lists, joined submissions, relay/land and card steps stay off.
