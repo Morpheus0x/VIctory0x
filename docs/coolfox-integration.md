@@ -43,24 +43,18 @@ newer code in those areas, and the patches conflict wholesale.
 
 ## Launchers, config, cache, saves
 
-`build.bat` and `run.bat` live in the repository root and carry **no paths**.
-Both accept the same arguments (`run` needs `--game` and `--data`; `build`
-ignores them, and both ignore the other's options):
+`build.bat` and `run.bat` are in the repository root.
 
-```
---repo DIR [--game FILE] [--data DIR] [--profile NAME] [--target TRIPLE]
-[--features LIST] [--agility 0|1] [--exe FILE] [--log FILE] [--warm 0|1]
-[--skip-pipelines LIST] [--texture-back LIST] [-- title args...]
-```
+- `build.bat [repo]` - repository defaults to the current directory.
+  Runs `cargo xtask agility` and `cargo build --locked --profile diag -p victory
+  --features diagnostics`.
+- `run.bat <game-dir> <data-dir> [repo]` - `game-dir` holds
+  `game_scarlett_master.exe`; `data-dir` holds `cache`, `data` (saves) and
+  `logs`; `repo` defaults to the current directory.
 
-`build.bat` stages the Agility SDK (`--agility 1`) and runs
-`cargo build --locked --profile <profile> -p victory --features <features>`.
-`run.bat` warms shaders (`victory shaders <shaders.rpf>`, skipped when
-`warm.sha` matches the exe and `--warm 1`), exports `VICTORY_GAME_DIR`,
-`VICTORY_CACHE_DIR`, `VICTORY_DATA_DIR`, and streams UTF-8 into
-`<data>\logs\run.log`. The cache lives under `<data>\cache`, saves under
-`<data>\data\<TITLEID>`; no config file is required (environment values
-resolve cool_fox's `[paths]`).
+Every other setting stays inside the script, as before: `run.bat` exports the
+tree's `VICTORY_*` switches, warms shaders (`victory shaders <shaders.rpf>` when
+`warm.sha` differs), and streams UTF-8 into `<data>\logs\run.log`.
 
 On this tree the 5-second frame line needs `victory_gpu::host=info`, which
 `run.bat` sets.
