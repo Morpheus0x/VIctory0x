@@ -9928,6 +9928,14 @@ impl Host {
         height: u32,
         format: DXGI_FORMAT,
     ) -> windows::core::Result<Presenter> {
+        // A resized window, and the borderless fullscreen the title's
+        // Ctrl+Enter switches to, keep the picture's aspect: DXGI scales the
+        // buffers to fit and leaves bars where the window is wider or
+        // taller. `VICTORY_ASPECT=stretch` asks for the old fill instead.
+        let scaling = match std::env::var("VICTORY_ASPECT").as_deref().map(str::trim) {
+            Ok("stretch") => DXGI_SCALING_STRETCH,
+            _ => DXGI_SCALING_ASPECT_RATIO_STRETCH,
+        };
         let hwnd = match title_window() {
             Some(hwnd) => hwnd,
             None => window(width, height)?,
@@ -9947,6 +9955,7 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Scaling: scaling,
                 ..Default::default()
             };
             let swap_chain = factory
