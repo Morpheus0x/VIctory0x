@@ -7,8 +7,8 @@
 //!
 //! "Changed" means a page of the memory was written since the last detiling
 //! ([`crate::watch`]), in write-watched memory; in physical-page views,
-//! which cannot be watched, a content hash of the whole memory at every
-//! submission that samples it.
+//! which cannot be watched, a content hash of the whole memory, at most
+//! once a frame however many submissions sample it.
 //!
 //! shortcut: a change detiles the whole texture, not the pages written.
 //! Only textures read through descriptor tables are brought up to date
@@ -106,6 +106,12 @@ struct Last {
     /// first checks, and after the hash found a change the guard had not
     /// seen ([`hot_textures`]). 0: not checked under the guard yet.
     hot_until: u64,
+    /// The frame whose check last hashed the whole memory, or read it
+    /// through the kernel, and left the staging buffer holding those bytes
+    /// (`hash` is their digest). A check again in that frame, the write
+    /// watch and the guards telling of no write since, would hash the very
+    /// same bytes: it is not hashed again ([`Staging::refresh_timed`]).
+    looked: Option<u64>,
 }
 
 /// Frames a guarded texture is hashed at every check from its first check,
@@ -412,6 +418,12 @@ pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 4] = [const { std::sy
 /// its own time a frame beside 1,100-1,800 ms of "textures"): it waits.
 /// These say for what.
 pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Since the last frame-rate line: refreshes that passed over hashing a
+/// texture, the whole of it already hashed in this frame and the write
+/// watch and the guards telling of no write since
+/// ([`Staging::refresh_timed`]).
+pub(crate) static PASSED_OVER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `f`'s result, its time added to [`REFRESH_WAITS`]' place `slot`.
 fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
@@ -1270,6 +1282,7 @@ impl Staging {
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // The guard saw no write: a change the hash finds came another way.
         let mut blind = false;
+        let frame = crate::frame::current();
         if !alone
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
@@ -1277,7 +1290,6 @@ impl Staging {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let frame = crate::frame::current();
             let turn = frame
                 .wrapping_add((start >> 16) as u64)
                 .is_multiple_of(HASH_EVERY);
@@ -1287,7 +1299,22 @@ impl Staging {
                 last.hot_until = frame + HOT_FRAMES;
             }
             let hot = hot_textures() && frame < last.hot_until;
+            // A texture is checked many times a frame: once for every
+            // submission that samples it, and again after every copy or step
+            // of ours that writes title memory (`crate::host::Batch`). This
+            // one has hashed the whole memory already in this frame, and the
+            // guard, asked just now, tells of no write since: the bytes are
+            // the ones that check hashed, and hashing them again only finds
+            // them the same. (A change that no write tells of, made between
+            // two checks of one frame, is found at the next frame's first
+            // check; the turn it would have been found at is up to eight
+            // frames later still. Writes the guard tells of are never
+            // passed over: this is only for the check that found none.)
             if unwritten && !turn && !hot {
+                return 0;
+            }
+            if unwritten && last.looked == Some(frame) {
+                PASSED_OVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return 0;
             }
             blind = unwritten;
@@ -1325,7 +1352,6 @@ impl Staging {
             // shortcut: read again at most every 30 frames (reading around
             // unmapped pages is slow, and nothing tells us when pages
             // arrive): a mip that streams in shows up to 30 frames late.
-            let frame = crate::frame::current();
             if last.partial.is_some_and(|at| frame < at + 30) {
                 return 0;
             }
@@ -1335,6 +1361,7 @@ impl Staging {
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 let hash = digest(read);
+                last.looked = Some(frame);
                 if last.hash == Some(hash) {
                     return false;
                 }
@@ -1359,6 +1386,7 @@ impl Staging {
                 let hash = digest(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+                last.looked = Some(frame);
                 if last.hash == Some(hash) {
                     return size;
                 }
@@ -1377,6 +1405,7 @@ impl Staging {
         let hash = digest(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+        last.looked = Some(frame);
         if last.hash == Some(hash) {
             return size;
         }
@@ -1398,11 +1427,15 @@ impl Staging {
     /// pages that are there ([`Staging::fill`]). Returns the bytes read.
     fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
+        let frame = crate::frame::current();
         let read = with_read(size, |read| {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
             let hash = digest(read);
+            // Read whole (through the kernel, every page of it there): what
+            // the staging buffer holds is what this frame's memory held.
+            last.looked = Some(frame);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);
