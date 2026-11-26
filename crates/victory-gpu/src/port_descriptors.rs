@@ -15,11 +15,13 @@
 //! with the one last seen (~290 pages, ~600,000 slots, 15-16 ms a frame of
 //! the heap-sync thread, 5-7 of it asking the watch, run port1-3).
 //!
-//! What is done here: the six stores are patched (`descriptor_sites`) to set
-//! a byte per slot and per 128 slots in maps of ours ([`MARKS`]), and our own
-//! mirroring marks too; `descriptor::sync_heaps` takes the marked slots
-//! ([`take`]) in place of the changed pages, and compares and makes only
-//! those, as before.
+//! What is done here: the six stores are patched (`descriptor_sites`, each
+//! byte-checked) to set a byte per slot and per 128 slots in maps of ours
+//! ([`MARKS`]), and our own mirroring marks too; `descriptor::sync_heaps`
+//! takes the marked slots ([`take`]) in place of the changed pages, and
+//! compares and makes only those, as before. All six or none: a site the
+//! title's bytes do not match leaves the port off ([`working`]), and the
+//! pages are scanned as before.
 //!
 //! Correctness first, the fallback: once a frame a few of the pages the
 //! write watch says were written ([`check_budget`], every
@@ -72,21 +74,30 @@ pub fn marks_address() -> usize {
     std::ptr::from_ref(&MARKS) as usize
 }
 
-/// The title's image (base, size) and how many of its stores were patched.
-static IMAGE: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+/// The title's image (base, size), how many of its record stores there are,
+/// and how many of them were patched.
+static IMAGE: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
 
-/// Told by the launcher: `patched` of the title's record stores in the image
-/// at `base` (`size` bytes) mark their slots.
-pub fn hooked(base: usize, size: usize, patched: usize) {
+/// Told by the launcher: `patched` of the `total` record stores of the title
+/// in the image at `base` (`size` bytes) mark their slots.
+pub fn hooked(base: usize, size: usize, patched: usize, total: usize) {
     IMAGE[0].store(base, Relaxed);
     IMAGE[1].store(size, Relaxed);
     IMAGE[2].store(patched, Relaxed);
+    IMAGE[3].store(total, Relaxed);
 }
 
 /// Whether [`take`] stands for the heap's changed pages: the switch is on and
-/// the stores were patched.
+/// every one of the title's record stores was patched.
+///
+/// A store whose bytes are not the ones expected is left alone
+/// (`descriptor_sites::apply`, another build of the title), and the slots its
+/// loop writes would never be told of. The fallback looks at a few pages a
+/// frame and can take many frames to reach a slot a draw reads: a stale view
+/// there is a wrong draw, not a slow one. So a partial patch leaves the port
+/// off, and the changed pages are scanned as before.
 fn working() -> bool {
-    on() && IMAGE[2].load(Relaxed) > 0
+    on() && IMAGE[3].load(Relaxed) > 0 && IMAGE[2].load(Relaxed) == IMAGE[3].load(Relaxed)
 }
 
 /// The heap whose slots are marked: its slots, and the places in the title's
@@ -113,6 +124,12 @@ fn adopt_now(start: u64, count: u32) -> bool {
         tracing::info!(start = format_args!("{start:#x}"), count, "renderer port 2: another placed view heap, looked at by its pages as before");
         return false;
     }
+    if count == 0 {
+        // A length of no slots: adopting it would take the changed pages of a
+        // heap with no mark to stand for them out of `sync_heaps`.
+        tracing::warn!(start = format_args!("{start:#x}"), "renderer port 2: a placed view heap of no records, looked at by its pages as before");
+        return false;
+    }
     let count = count as usize;
     let leak = |n: usize| -> &'static [AtomicU8] { Box::leak((0..n).map(|_| AtomicU8::new(0)).collect()) };
     // (Never freed: a store of the title's may be marking while the heap
@@ -129,7 +146,7 @@ fn adopt_now(start: u64, count: u32) -> bool {
     tracing::info!(
         start = format_args!("{start:#x}"),
         count,
-        stores = IMAGE[2].load(Relaxed),
+        stores = IMAGE[3].load(Relaxed),
         "renderer port 2: the title's view heap's slots are told by its record stores and our calls, not looked for on its pages (VICTORY_PORT_DESCRIPTORS)"
     );
     true
@@ -436,8 +453,17 @@ pub(crate) fn line(frames: f64) {
     ALL[0].fetch_add(taken, Relaxed);
     ALL[1].fetch_add(ours, Relaxed);
     ALL[2].fetch_add(pages, Relaxed);
+    // The pages the watch said were written that the fallback has not looked
+    // at yet: a backlog that grows means it cannot keep up with what the
+    // stores do not tell of.
+    let queued = FALLBACK.lock().unwrap_or_else(|e| e.into_inner()).pages.len();
     if !working() {
-        tracing::info!("renderer port 2 (VICTORY_PORT_DESCRIPTORS=1): not working, no store of the title's was patched");
+        tracing::info!(
+            "renderer port 2 (VICTORY_PORT_DESCRIPTORS=1): not working, {} of {} record stores of the title patched; its view heap's changed pages are scanned as before ({} pages waiting for the fallback)",
+            IMAGE[2].load(Relaxed),
+            IMAGE[3].load(Relaxed),
+            queued
+        );
         return;
     }
     let writers = {
@@ -448,11 +474,11 @@ pub(crate) fn line(frames: f64) {
     };
     tracing::info!(
         "renderer port 2 (VICTORY_PORT_DESCRIPTORS=1) per frame: {:.0} slots told (of them {:.0} marked by our calls, the rest by the title's {} patched stores) in {:.1} takings, {:.3} ms taking; \
-         of the title's memcpy/memmove calls into the heap {:.0}, {:.0} records they marked; fallback: {:.1} pages looked at whole, {:.2} view records no store told of ({:.2} of them of draws' tables), {:.0} other records changed, {:.1} told and not taken yet, {:.2} ms; \
+         of the title's memcpy/memmove calls into the heap {:.0}, {:.0} records they marked; fallback: {:.1} pages looked at whole, {:.2} view records no store told of ({:.2} of them of draws' tables), {:.0} other records changed, {:.1} told and not taken yet, {:.2} ms, {} pages still to look at; \
          since the start: {} slots told ({} by our calls), {} pages looked at, {} view records missed; their writers: {}",
         taken as f64 / frames,
         ours as f64 / frames,
-        IMAGE[2].load(Relaxed),
+        IMAGE[3].load(Relaxed),
         takings as f64 / frames,
         ns as f64 / 1e6 / frames,
         copies[0] as f64 / frames,
@@ -463,6 +489,7 @@ pub(crate) fn line(frames: f64) {
         other as f64 / frames,
         pending as f64 / frames,
         check_ns as f64 / 1e6 / frames,
+        queued,
         ALL[0].load(Relaxed),
         ALL[1].load(Relaxed),
         ALL[2].load(Relaxed),

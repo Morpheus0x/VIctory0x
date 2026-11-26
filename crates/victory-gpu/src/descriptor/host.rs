@@ -3107,7 +3107,10 @@ impl HostHeap {
         let Some(offset) = gpu.checked_sub(base).filter(|&o| o < width && crate::port_cbv::raw_ok(o)) else {
             return false;
         };
-        let bytes = u64::from(constant_bytes(size)).min(width - offset) & !3;
+        // What of the buffer the view can hold, in 64-bit (a buffer past
+        // 4 GiB would lose the top of `width - offset` in the 32-bit cast).
+        let room = width - offset;
+        let bytes = u64::from(constant_bytes(size)).min(room) & !3;
         if bytes == 0 {
             return false;
         }
@@ -3126,7 +3129,7 @@ impl HostHeap {
         };
         let cbv = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: if gpu.is_multiple_of(256) { gpu } else { 0 },
-            SizeInBytes: if gpu.is_multiple_of(256) { constant_bytes(size).min(((width - offset) & !255) as u32) } else { 0 },
+            SizeInBytes: if gpu.is_multiple_of(256) { u64::from(constant_bytes(size)).min(room & !255) as u32 } else { 0 },
         };
         let cbv = if cbv.SizeInBytes == 0 { D3D12_CONSTANT_BUFFER_VIEW_DESC::default() } else { cbv };
         // SAFETY: slots of our heaps; the ranges lie in the live buffer (a
