@@ -13,7 +13,6 @@ if not defined REPO set "REPO=%CD%"
 set "CACHE=%DATA%\cache"
 set "DATADIR=%DATA%\data"
 set "LOGS=%DATA%\logs"
-set "LOG=%LOGS%\run.log"
 set "EXE=%REPO%\target\diag\victory.exe"
 
 if not exist "%GAME%" (
@@ -25,6 +24,9 @@ if not exist "%EXE%" (
   exit /b 2
 )
 for %%D in ("%DATA%" "%CACHE%" "%DATADIR%" "%LOGS%") do if not exist "%%~D" mkdir "%%~D"
+set "BRANCH=dev"
+for /f %%T in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "TS=%%T"
+set "LOG=%LOGS%\run_%BRANCH%_%TS%.log"
 
 goto body
 
@@ -43,7 +45,7 @@ set "VICTORY_DATA_DIR=%DATADIR%"
 set VICTORY_LOG=warn
 set RUST_BACKTRACE=1
 set VICTORY_FRAME_LOG=1
-set VICTORY_FRAME_LOG_FILE=%LOGS%\frame.log
+set VICTORY_FRAME_LOG_FILE=%LOGS%\frame_%BRANCH%_%TS%.log
 set VICTORY_AMBIENT=0.6
 set VICTORY_HAIR=1
 set VICTORY_TEXTURE_BACK=64x64f16,128x128f36

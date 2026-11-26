@@ -5,6 +5,8 @@
 //! only in builds with the `diagnostics` feature; a plain release build
 //! logs info and above whatever the filter asks for.
 
+use std::io::IsTerminal;
+
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -29,6 +31,7 @@ pub fn init(default_level: &str) {
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(true)
+                .with_ansi(std::io::stderr().is_terminal())
                 .with_writer(std::io::stderr),
         )
         .try_init();
