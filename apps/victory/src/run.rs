@@ -200,8 +200,14 @@ pub fn run(
         // marks are a static.
         let done = unsafe { apply(image.base(), size, victory_hle::port_descriptors::marks_address(), &SITES) };
         let patched = done.iter().filter(|d| **d == Hooked::Done).count();
-        println!("renderer port 2: {patched} of {} descriptor record stores of the title patched", SITES.len());
-        victory_hle::port_descriptors::hooked(image.base(), size, patched);
+        // Every store or none: one left alone would leave the records of its
+        // loop untold, and the port stays off (`port_descriptors::working`).
+        println!(
+            "renderer port 2: {patched} of {} descriptor record stores of the title patched{}",
+            SITES.len(),
+            if patched == SITES.len() { "" } else { "; the port stays off, changed pages are scanned as before" }
+        );
+        victory_hle::port_descriptors::hooked(image.base(), size, patched, SITES.len());
     }
     // The frame rate (VICTORY_FRAME_INTERVAL_MS, off without it): our frame
     // clock ticks at that interval (victory-gpu), and the title is given

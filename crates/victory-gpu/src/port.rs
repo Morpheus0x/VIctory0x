@@ -251,12 +251,20 @@ fn bounds(regions: &[Region]) {
 /// forgotten (what is placed in them is let go by the caller).
 pub(crate) fn forget(at: usize, len: usize) {
     let (at, end) = (at as u64, (at as u64).saturating_add(len as u64));
-    if BOUNDS[1].load(Ordering::Relaxed) <= at || BOUNDS[0].load(Ordering::Relaxed) >= end {
+    // (Only a look when no region was ever opened. A range test on `BOUNDS`
+    // here could read bounds taken before `place_in` stored a region that
+    // covers this range - it holds the lock - and then leave that region
+    // standing over pages the title has since mapped anew; `place_in` would
+    // hand it out again for the new bytes. So the regions themselves decide.)
+    if BOUNDS[1].load(Ordering::Relaxed) == 0 {
         return;
     }
     let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
     let before = regions.len();
     regions.retain(|r| r.end <= at || r.start >= end);
+    if regions.len() == before {
+        return;
+    }
     STATS[7].fetch_add((before - regions.len()) as u64, Ordering::Relaxed);
     bounds(&regions);
 }
@@ -291,8 +299,14 @@ pub(crate) fn log(frames: f64) {
     }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     let per: Vec<f64> = STATS[9..].iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    // What is in place now (regions opened and not since forgotten), beside
+    // what was opened since the start.
+    let (regions, bytes) = {
+        let regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+        (regions.len() as u64, regions.iter().map(|r| r.end - r.start).sum::<u64>() >> 20)
+    };
     tracing::info!(
-        "renderer port 1 (VICTORY_PORT_CONSTANTS=1): {} regions of the title's graphics memory in place ({} MB), {} title buffers and windows placed in them \
+        "renderer port 1 (VICTORY_PORT_CONSTANTS=1): {regions} regions of the title's graphics memory in place now ({bytes} MB; {} opened since the start, {} MB), {} title buffers and windows placed in them \
          (no host copy, nothing sent up or fetched back for them); per frame on the CPU: {:.0} fills read out of them ({:.1} KB), {:.1} buffer copies \
          touching them ({:.1} KB); since the start refused: {} not one stretch of a section, {} not committed, {} by the host, {} no buffer; {} regions \
          forgotten (other pages mapped there)",
