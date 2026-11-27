@@ -232,12 +232,46 @@ fn stage() -> u32 {
 /// free.) The title's threads are not asked for.
 pub(crate) fn keep_on_fast_cores(what: &str) {
     ask(what, 1);
+    on_the_chain(what);
 }
 
 /// [`keep_on_fast_cores`] for one of the threads a submission's preparing or
 /// a landing shares its work with.
 pub(crate) fn keep_helper_on_fast_cores(what: &str) {
     ask(what, 2);
+    on_the_chain(what);
+}
+
+/// The calling thread, one a frame waits for (or one of its helpers), runs
+/// above normal priority (`VICTORY_CHAIN_PRIORITY=1`; the submitting thread
+/// does already, `crate::queue::behind`).
+///
+/// On eight cores the title's threads and ours want more than there is: a
+/// timeline found threads of the frame's chain ready and not running 12 ms a
+/// frame, behind streaming and other work that no frame waits for. The
+/// landing that tells the title its frames are done, the heaps' records the
+/// submitting thread waits for, the pass over the heap's views, the late gate
+/// and their helpers go first with this. Ported from nyalone/gta6-victory-pc
+/// 01adfce (measured there: median 45.5-47.8 ms against 46.6-49.3).
+fn on_the_chain(what: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| {
+        std::env::var_os("VICTORY_CHAIN_PRIORITY").is_some_and(|v| v == "1")
+    }) {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+        };
+        // SAFETY: the calling thread's own pseudo-handle.
+        if unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) } != 0 {
+            tracing::debug!(what, "above normal priority (VICTORY_CHAIN_PRIORITY)");
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = what;
 }
 
 /// [`keep_on_fast_cores`] for one of many threads whose work is ahead of what
