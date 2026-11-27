@@ -1434,10 +1434,19 @@ pub(crate) fn want_level(this: This, first: u32) {
     if r.desc.dimension == BUFFER || !r.host.placed.load(Relaxed) {
         return;
     }
+    // (A measurement under one lock for all the recording threads, at every
+    // draw's texture: diagnostics builds only.)
+    #[cfg(feature = "diagnostics")]
     if r.desc.mip_levels > 1 {
         crate::texlate::viewed(this as usize, first);
     }
-    let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    // A texture another thread holds is asked again at its next draw: the
+    // ask only replaces a copy without the level, later.
+    let mut made = match r.host.made.try_lock() {
+        Ok(made) => made,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
     let Some((host, _)) = made.as_ref() else {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
@@ -1479,8 +1488,10 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
 /// title places in that memory in another format shows ([`alias_of`]). A
 /// texture leaves the table before it is freed.
 #[cfg(windows)]
-static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+// Read-write: every draw that reads a placed texture looks here
+// (`alias_of`), from all the recording threads at once.
+static TARGETS_AT: std::sync::RwLock<std::collections::BTreeMap<u64, usize>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
 
 /// For `this`, a texture made for a view the title placed in memory
 /// ([`texture_at`]): the title texture the host writes that lies in the
@@ -1527,7 +1538,7 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
         return None;
     }
     // Under the table's lock: a texture leaves it before it is freed.
-    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let targets = TARGETS_AT.read().unwrap_or_else(|e| e.into_inner());
     let other = *targets.get(&(r.data() as u64))? as This;
     let o = resource(other);
     const DEPTH: u32 = 0x2;
@@ -2805,7 +2816,7 @@ fn hand_out_resource(
         crate::texback::replaced(resource.data() as usize);
         if !fills(&desc) {
             TARGETS_AT
-                .lock()
+                .write()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(resource.data() as u64, at);
         }
@@ -2832,7 +2843,7 @@ impl Drop for Resource {
             crate::texlate::gone(address);
             textures().remove(&address);
             if !fills(&self.desc) {
-                let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+                let mut targets = TARGETS_AT.write().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
                 if targets.get(&at) == Some(&(std::ptr::from_ref::<Resource>(self) as usize)) {
                     targets.remove(&at);

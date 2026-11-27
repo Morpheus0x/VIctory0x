@@ -1426,9 +1426,13 @@ const STAMPS: u32 = 4096;
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
 
+// Keyed by address with the address hash, not SipHash: every draw's
+// textures are looked up here (7 ms a frame of the recording threads hashing
+// in the boat scene, profile q1).
 type States = std::collections::HashMap<
     usize,
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
+    std::hash::BuildHasherDefault<AddressHash>,
 >;
 
 /// What a list does with a depth texture that has a colour twin

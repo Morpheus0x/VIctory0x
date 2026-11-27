@@ -54,9 +54,16 @@ fn parts_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_PARTS").is_none_or(|v| v != "0"))
 }
 
+/// Pages a block of [`Shard::blocks`] holds (16: 1 MiB).
+const BLOCK_SHIFT: u32 = 4;
+
 impl Shard {
     const fn new() -> Shard {
-        Shard { written: BTreeMap::new(), parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()) }
+        Shard {
+            written: BTreeMap::new(),
+            parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            blocks: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+        }
     }
 
     /// Page `page` was found written by asking `now`: the parts in `parts`
@@ -69,6 +76,11 @@ impl Shard {
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
         let before = self.written.get(&page).copied().unwrap_or(0);
         self.written.insert(page, before.max(now));
+        // The block's newest note, at least (notes only go up; a page taken
+        // out leaves it as it was, which is still enough for
+        // [`Notes::all_at_most`]).
+        let newest = self.blocks.entry(page >> BLOCK_SHIFT).or_insert(0);
+        *newest = (*newest).max(before.max(now));
         if parts == WHOLE || !parts_on() {
             if now >= before {
                 self.parts.remove(&page);
@@ -137,6 +149,9 @@ struct Shard {
     /// the parts are known ([`parts_on`]); a page that is not here was
     /// written whole, as far as anyone knows.
     parts: std::collections::HashMap<usize, [u64; PARTS], std::hash::BuildHasherDefault<PageHash>>,
+    /// Block ([`BLOCK_SHIFT`] pages) → the newest asking noted for a page of
+    /// it, at least.
+    blocks: std::collections::HashMap<usize, u64, std::hash::BuildHasherDefault<PageHash>>,
 }
 
 impl Notes {
@@ -187,6 +202,30 @@ impl Notes {
                 all.into_iter().all(|(p, w)| each(p, w))
             }
         }
+    }
+
+    /// Whether every note of pages `[first, last)` is at most
+    /// `bound(page)`, as [`Notes::each`] with that test answers. A block whose
+    /// newest note is at most the least bound of its pages in the range passes
+    /// without its pages being looked at; only the others are walked page by
+    /// page. (`nothing_new`'s walk over every page a big copy holds, about
+    /// 5,400 times a frame, was 15-19 ms of the list threads' frame in the
+    /// boat scene, profile q1.)
+    fn all_at_most(&self, first: usize, last: usize, bound: impl Fn(usize) -> u64) -> bool {
+        let mut from = first;
+        while from < last {
+            let block = from >> BLOCK_SHIFT;
+            let to = last.min((block + 1) << BLOCK_SHIFT);
+            let least = (from..to).map(&bound).min().unwrap_or(u64::MAX);
+            let s = self.read(shard_of(from));
+            let newest = s.blocks.get(&block).copied().unwrap_or(0);
+            if newest > least && !s.written.range(from..to).all(|(&p, &w)| w <= bound(p)) {
+                return false;
+            }
+            drop(s);
+            from = to;
+        }
+        true
     }
 
     /// The notes of pages `[first, last)` in page order. A part at a time.
@@ -1382,7 +1421,8 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         return false;
     };
     (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.notes.each(first, last, |page, write| write <= taken[page - first].max(ranged))
+        && j.notes
+            .all_at_most(first, last, |page| taken[page - first].max(ranged))
 }
 
 impl Tracked {

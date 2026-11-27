@@ -2844,7 +2844,13 @@ impl HostHeap {
             self.copy_from(index, views.slot(made.at));
             if made.twin && twins {
                 self.copy_from(self.raw + index, views.slot(made.at + 1));
-                self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
+                // (Looked at before it is set: nearly always it is set
+                // already, and a store takes the cache line from the other
+                // recording threads at every draw.)
+                let shown = &self.twins[index as usize];
+                if !shown.load(std::sync::atomic::Ordering::Relaxed) {
+                    shown.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             } else {
                 self.clear_twin(index);
             }
@@ -2896,7 +2902,10 @@ impl HostHeap {
 
     /// The raw twin of slot `index` is a null view again.
     fn clear_twin(&self, index: u32) {
+        // (Looked at before it is swapped: nearly always it is clear already,
+        // and a swap takes the cache line from the other recording threads.)
         if let Some(made) = self.twins.get(index as usize)
+            && made.load(std::sync::atomic::Ordering::Relaxed)
             && made.swap(false, std::sync::atomic::Ordering::Relaxed)
         {
             null_buffer_view(self.at(self.raw + index));
