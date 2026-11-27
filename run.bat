@@ -61,6 +61,9 @@ set VICTORY_CARD_STEPS=2
 set VICTORY_INDIRECT_BATCH=2
 set VICTORY_MAP_THREADS=1
 set VICTORY_TITLE_PRIORITIES=0
+rem The threads a frame waits for (relay, heaps' records, heap-view pass,
+rem late gate) go above normal (measured 1-2 ms median on a busy CPU).
+set VICTORY_CHAIN_PRIORITY=1
 set VICTORY_CARD_AWAKE=1
 set VICTORY_SHOW_AFTER=1
 set VICTORY_D3D12_DRED=light
