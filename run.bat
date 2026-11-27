@@ -67,6 +67,14 @@ set VICTORY_D3D12_DRED=light
 set VICTORY_THIN=1
 set VICTORY_JOIN_PARTS=8
 set VICTORY_UPLOAD_AHEAD=1
+rem Renderer ports (off upstream while they were tested): the title's
+rem constants heap read in place, its descriptor stores told, raw constant
+rem buffers, and the guard/journal locks shared. The big CPU-side win.
+set VICTORY_PORT_CONSTANTS=1
+set VICTORY_PORT_DESCRIPTORS=1
+set VICTORY_PORT_CBV=1
+set VICTORY_PORT_GUARD=1
+set VICTORY_PORT_JOURNAL=1
 rem Stopgap until the sky-following ambient is ported onto this tree: the
 rem constant beloooo used, instead of the screen-radiance estimate.
 set VICTORY_AMBIENT=constant:0.6
