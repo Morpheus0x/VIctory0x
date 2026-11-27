@@ -1131,6 +1131,17 @@ impl Host {
         // SAFETY: a plain query.
         adapter.map_or(0, |a| unsafe { a.CheckInterfaceSupport(&IDXGIDevice::IID) }.unwrap_or(0))
     }
+
+    /// The adapter's vendor and device ids (0, 0: not known): a compiler
+    /// crash is the driver's, and one PC may keep a cache for more than one
+    /// GPU.
+    pub(crate) fn adapter_ids(&self) -> (u32, u32) {
+        self.adapter
+            .as_ref()
+            // SAFETY: a plain query on the live adapter.
+            .and_then(|a| unsafe { a.GetDesc1().ok() })
+            .map_or((0, 0), |d| (d.VendorId, d.DeviceId))
+    }
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).

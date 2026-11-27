@@ -82,7 +82,11 @@ impl Pending {
         if self.made.get().is_none() {
             let made = if is_bad_key(&self.key) {
                 SKIPPED_BAD.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(key = self.key, shaders = ?self.shaders, "not made: the driver's compiler crashed on it before");
+                tracing::warn!(
+                    key = self.key,
+                    shaders = ?self.shaders,
+                    "not made: two compiler crashes under this driver, adapter and translation; VICTORY_WARM_BAD=0 tries it now"
+                );
                 None
             } else {
                 let _building = crate::timeline::span("pipeline: build a host pipeline");
@@ -123,7 +127,9 @@ fn bad_keys<R>(f: impl FnOnce(&mut std::collections::HashSet<String>) -> R) -> R
         if listed.is_empty() {
             return Default::default();
         }
-        super::known::parse_bad_keys(&listed, &super::known::fingerprint())
+        // Two recorded crashes under this driver, adapter and translation
+        // leave it out; one is retried once in a new process.
+        super::known::parse_bad_keys_min(&listed, &super::known::bad_fingerprint(), 2)
     });
     f(keys)
 }
@@ -301,7 +307,7 @@ fn lost(slot: usize) {
             .append(true)
             .open(dir.join(super::known::WARM_BAD_FILE));
         if let Ok(mut f) = file {
-            let fingerprint = super::known::fingerprint();
+            let fingerprint = super::known::bad_fingerprint();
             let reason = format!("ended the compiler in a run: {:?}", p.shaders);
             let _ = writeln!(f, "{}", super::known::format_bad_entry(&p.key, &fingerprint, &reason));
         }

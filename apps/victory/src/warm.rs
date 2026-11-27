@@ -57,6 +57,9 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let began = Instant::now();
     victory_hle::known_pipelines::use_translations(dir.with_file_name("shaders"));
     let fingerprint = known::fingerprint();
+    // The bad list is scoped to the adapter too: a compiler crash is the
+    // driver's, and one PC may keep a cache for more than one GPU.
+    let bad_fingerprint = known::bad_fingerprint();
     let done_file = dir.join("warm-done.txt");
     let bad_file = dir.join(known::WARM_BAD_FILE);
     let keys = known::keys(&dir);
@@ -73,7 +76,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         HashSet::new()
     } else {
         let text = std::fs::read_to_string(&bad_file).unwrap_or_default();
-        known::parse_bad_keys(&text, &fingerprint)
+        known::parse_bad_keys(&text, &bad_fingerprint)
     };
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
     let early: HashSet<&str> = early.lines().collect();
@@ -112,7 +115,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         },
         |n, why| {
             println!("pipeline {n} {}: {why}", keys[n]);
-            let _ = writeln!(lock(&bad_out), "{}", known::format_bad_entry(&keys[n], &fingerprint, &why));
+            let _ = writeln!(lock(&bad_out), "{}", known::format_bad_entry(&keys[n], &bad_fingerprint, &why));
             lock(&state).2 += 1;
         },
     )?;

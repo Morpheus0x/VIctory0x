@@ -259,6 +259,22 @@ pub fn fingerprint() -> String {
     h.finalize().to_hex()[..16].to_owned()
 }
 
+/// What [`WARM_BAD_FILE`] entries are kept under: [`fingerprint`] and the
+/// adapter, since a compiler crash is the driver's and one PC may keep a
+/// pipeline cache for more than one GPU.
+pub fn bad_fingerprint() -> String {
+    let base = fingerprint();
+    #[cfg(windows)]
+    let (vendor, device) = crate::host::host().map_or((0, 0), |h| h.adapter_ids());
+    #[cfg(not(windows))]
+    let (vendor, device) = (0u32, 0u32);
+    let mut h = blake3::Hasher::new();
+    h.update(base.as_bytes());
+    h.update(&vendor.to_le_bytes());
+    h.update(&device.to_le_bytes());
+    h.finalize().to_hex()[..16].to_owned()
+}
+
 /// Whether `warm-bad.txt` is ignored (`VICTORY_WARM_BAD=0`).
 pub fn bad_list_disabled() -> bool {
     std::env::var_os("VICTORY_WARM_BAD").is_some_and(|v| v == "0")
@@ -288,7 +304,15 @@ pub fn format_bad_entry(key: &str, fingerprint: &str, reason: &str) -> String {
 /// automatically retries them. Legacy or manually added bare-key lines
 /// (`<key> ...`) continue to apply regardless of fingerprint.
 pub fn parse_bad_keys(text: &str, fingerprint: &str) -> HashSet<String> {
-    let mut keys = HashSet::new();
+    parse_bad_keys_min(text, fingerprint, 1)
+}
+
+/// Pipeline keys `warm-bad.txt` lists for `fingerprint` at least `min` times:
+/// the runtime leaves one out only after [`BAD_TRIES`] compiler crashes under
+/// this driver, adapter and translation, so a single transient crash is
+/// retried once in a new process.
+pub fn parse_bad_keys_min(text: &str, fingerprint: &str, min: usize) -> HashSet<String> {
+    let mut keys: HashMap<String, usize> = HashMap::new();
     for line in text.lines() {
         let line = line.trim_start();
         if line.is_empty() || line.starts_with('#') {
@@ -303,20 +327,23 @@ pub fn parse_bad_keys(text: &str, fingerprint: &str) -> HashSet<String> {
                 && is_hex(fp, 16)
             {
                 if fp == fingerprint {
-                    keys.insert(first.to_owned());
+                    *keys.entry(first.to_owned()).or_default() += 1;
                 }
                 continue;
             }
             if is_hex(first, 16) && is_hex(second, 32) {
                 if first == fingerprint {
-                    keys.insert(second.to_owned());
+                    *keys.entry(second.to_owned()).or_default() += 1;
                 }
                 continue;
             }
         }
-        keys.insert(first.to_owned());
+        *keys.entry(first.to_owned()).or_default() += 1;
     }
-    keys
+    keys.into_iter()
+        .filter(|&(_, times)| times >= min)
+        .map(|(key, _)| key)
+        .collect()
 }
 
 /// The translations of earlier runs are in `dir` (the pipeline library is
@@ -695,6 +722,23 @@ mod tests {
                 "manual-skip-key".to_owned(),
                 k_bad_tag,
             ])
+        );
+    }
+
+    #[test]
+    fn a_pipeline_is_left_out_only_after_two_crashes_under_one_fingerprint() {
+        let key = "3".repeat(32);
+        let one = format_bad_entry(&key, "8899aabbccddeeff", "crashed");
+        assert!(parse_bad_keys_min(&one, "8899aabbccddeeff", 2).is_empty());
+        let two = format!("{one}\n{one}\n");
+        assert_eq!(
+            parse_bad_keys_min(&two, "8899aabbccddeeff", 2),
+            HashSet::from([key.clone()])
+        );
+        // The old single-crash reading remains for the warm-up's own list.
+        assert_eq!(
+            parse_bad_keys(&one, "8899aabbccddeeff"),
+            HashSet::from([key])
         );
     }
 }
